@@ -55,6 +55,10 @@ func (c *commandVolumeFixReplication) Help() string {
 `
 }
 
+func (c *commandVolumeFixReplication) HasTag(tag CommandTag) bool {
+	return false && tag == ResourceHeavy // resource intensive only when deleting and checking with replicas.
+}
+
 func (c *commandVolumeFixReplication) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	volFixReplicationCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
