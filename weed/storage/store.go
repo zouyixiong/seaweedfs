@@ -631,8 +631,8 @@ func (s *Store) MaybeAdjustVolumeMax() (hasChanges bool) {
 			var unusedSpace uint64 = 0
 			unclaimedSpaces := int64(diskStatus.Free)
 			if !s.GetPreallocate() {
-				unusedSpace = diskLocation.UnUsedSpace(volumeSizeLimit)
-				unclaimedSpaces -= int64(unusedSpace)
+				// unusedSpace = diskLocation.UnUsedSpace(volumeSizeLimit)
+				// unclaimedSpaces -= int64(unusedSpace)
 			}
 			volCount := diskLocation.VolumesLen()
 			ecShardCount := diskLocation.EcShardCount()
