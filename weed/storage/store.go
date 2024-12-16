@@ -630,8 +630,12 @@ func (s *Store) MaybeAdjustVolumeMax() (hasChanges bool) {
 			var unusedSpace uint64 = 0
 			unclaimedSpaces := int64(diskStatus.Free)
 			if !s.GetPreallocate() {
-				unusedSpace = diskLocation.UnUsedSpace(volumeSizeLimit)
-				unclaimedSpaces -= int64(unusedSpace)
+				// 不计算已分配但没有写满的 volume 的待写入空间，图普按小时创建 bucket的用法会有较多这样的 volume，它们不会再被写入
+				// 暂时没找到其他不修改代码的方案：
+				// 1：把 volumes 都改为 readonly，不行：seaweed 还会自动为 collection 创建新的 writable volume，seaweed 目前没法标记 collection 级别 readonly
+				// 2：配置为 -volumePreallocate: true, 不行：预分配实际就是在文件系统上咱用了对应的空间，还是造成了实际空间利用率不高
+				// unusedSpace = diskLocation.UnUsedSpace(volumeSizeLimit)
+				// unclaimedSpaces -= int64(unusedSpace)
 			}
 			volCount := diskLocation.VolumesLen()
 			ecShardCount := diskLocation.EcShardCount()
