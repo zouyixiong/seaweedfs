@@ -13,7 +13,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
+	"slices"
 
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -112,13 +112,13 @@ func (c *commandFsMergeVolumes) Do(args []string, commandEnv *CommandEnv, writer
 				return
 			}
 			for _, chunk := range entry.Chunks {
-				if chunk.IsChunkManifest {
-					fmt.Printf("Change volume id for large file is not implemented yet: %s/%s\n", parentPath, entry.Name)
-					continue
-				}
 				chunkVolumeId := needle.VolumeId(chunk.Fid.VolumeId)
 				toVolumeId, found := plan[chunkVolumeId]
 				if !found {
+					continue
+				}
+				if chunk.IsChunkManifest {
+					fmt.Printf("Change volume id for large file is not implemented yet: %s/%s\n", parentPath, entry.Name)
 					continue
 				}
 				path := parentPath.Child(entry.Name)

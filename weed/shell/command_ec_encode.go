@@ -65,7 +65,7 @@ func (c *commandEcEncode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 	collection := encodeCommand.String("collection", "", "the collection name")
 	fullPercentage := encodeCommand.Float64("fullPercent", 95, "the volume reaches the percentage of max volume size")
 	quietPeriod := encodeCommand.Duration("quietFor", time.Hour, "select volumes without no writes for this period")
-	parallelize := encodeCommand.Bool("parallelize", true, "parallelize operations whenever possible")
+	maxParallelization := encodeCommand.Int("maxParallelization", 10, "run up to X tasks in parallel, whenever possible")
 	forceChanges := encodeCommand.Bool("force", false, "force the encoding even if the cluster has less than recommended 4 nodes")
 	shardReplicaPlacement := encodeCommand.String("shardReplicaPlacement", "", "replica placement for EC shards, or master default if empty")
 	applyBalancing := encodeCommand.Bool("rebalance", false, "re-balance EC shards after creation")
@@ -119,19 +119,19 @@ func (c *commandEcEncode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 
 	// encode all requested volumes...
 	for _, vid := range volumeIds {
-		if err = doEcEncode(commandEnv, *collection, vid); err != nil {
+		if err = doEcEncode(commandEnv, *collection, vid, *maxParallelization); err != nil {
 			return fmt.Errorf("ec encode for volume %d: %v", vid, err)
 		}
 	}
 	// ...then re-balance ec shards.
-	if err := EcBalance(commandEnv, collections, "", rp, *parallelize, *applyBalancing); err != nil {
+	if err := EcBalance(commandEnv, collections, "", rp, *maxParallelization, *applyBalancing); err != nil {
 		return fmt.Errorf("re-balance ec shards for collection(s) %v: %v", collections, err)
 	}
 
 	return nil
 }
 
-func doEcEncode(commandEnv *CommandEnv, collection string, vid needle.VolumeId) error {
+func doEcEncode(commandEnv *CommandEnv, collection string, vid needle.VolumeId, maxParallelization int) error {
 	if !commandEnv.isLocked() {
 		return fmt.Errorf("lock is lost")
 	}
@@ -142,11 +142,18 @@ func doEcEncode(commandEnv *CommandEnv, collection string, vid needle.VolumeId) 
 		return fmt.Errorf("volume %d not found", vid)
 	}
 
-	// fmt.Printf("found ec %d shards on %v\n", vid, locations)
-
 	// mark the volume as readonly
-	if err := markVolumeReplicasWritable(commandEnv.option.GrpcDialOption, vid, locations, false, false); err != nil {
-		return fmt.Errorf("mark volume %d as readonly on %s: %v", vid, locations[0].Url, err)
+	ewg := NewErrorWaitGroup(maxParallelization)
+	for _, location := range locations {
+		ewg.Add(func() error {
+			if err := markVolumeReplicaWritable(commandEnv.option.GrpcDialOption, vid, location, false, false); err != nil {
+				return fmt.Errorf("mark volume %d as readonly on %s: %v", vid, location.Url, err)
+			}
+			return nil
+		})
+	}
+	if err := ewg.Wait(); err != nil {
+		return err
 	}
 
 	// generate ec shards

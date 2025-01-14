@@ -18,8 +18,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"golang.org/x/exp/slices"
 	"google.golang.org/grpc"
+	"slices"
 )
 
 type DataCenterId string
@@ -112,6 +112,53 @@ var (
 	// Overridable functions for testing.
 	getDefaultReplicaPlacement = _getDefaultReplicaPlacement
 )
+
+type ErrorWaitGroup struct {
+	maxConcurrency int
+	wg             *sync.WaitGroup
+	wgSem          chan bool
+	errors         []error
+	errorsMu       sync.Mutex
+}
+type ErrorWaitGroupTask func() error
+
+func NewErrorWaitGroup(maxConcurrency int) *ErrorWaitGroup {
+	if maxConcurrency <= 0 {
+		// No concurrency = one task at the time
+		maxConcurrency = 1
+	}
+	return &ErrorWaitGroup{
+		maxConcurrency: maxConcurrency,
+		wg:             &sync.WaitGroup{},
+		wgSem:          make(chan bool, maxConcurrency),
+	}
+}
+
+func (ewg *ErrorWaitGroup) Add(f ErrorWaitGroupTask) {
+	if ewg.maxConcurrency <= 1 {
+		// Keep run order deterministic when parallelization is off
+		ewg.errors = append(ewg.errors, f())
+		return
+	}
+
+	ewg.wg.Add(1)
+	go func() {
+		ewg.wgSem <- true
+
+		err := f()
+		ewg.errorsMu.Lock()
+		ewg.errors = append(ewg.errors, err)
+		ewg.errorsMu.Unlock()
+
+		<-ewg.wgSem
+		ewg.wg.Done()
+	}()
+}
+
+func (ewg *ErrorWaitGroup) Wait() error {
+	ewg.wg.Wait()
+	return errors.Join(ewg.errors...)
+}
 
 func _getDefaultReplicaPlacement(commandEnv *CommandEnv) (*super_block.ReplicaPlacement, error) {
 	var resp *master_pb.GetMasterConfigurationResponse
@@ -553,52 +600,15 @@ func groupBy(data []*EcNode, identifierFn func(*EcNode) (id string)) map[string]
 }
 
 type ecBalancer struct {
-	commandEnv       *CommandEnv
-	ecNodes          []*EcNode
-	replicaPlacement *super_block.ReplicaPlacement
-	applyBalancing   bool
-	parallelize      bool
-
-	wg       *sync.WaitGroup
-	wgErrors []error
+	commandEnv         *CommandEnv
+	ecNodes            []*EcNode
+	replicaPlacement   *super_block.ReplicaPlacement
+	applyBalancing     bool
+	maxParallelization int
 }
 
-type ecBalancerTask func() error
-
-func (ecb *ecBalancer) wgInit() {
-	if ecb.wg != nil {
-		return
-	}
-	ecb.wg = &sync.WaitGroup{}
-	ecb.wgErrors = nil
-}
-
-func (ecb *ecBalancer) wgAdd(f ecBalancerTask) {
-	if ecb.wg == nil || !ecb.parallelize {
-		if err := f(); err != nil {
-			ecb.wgErrors = append(ecb.wgErrors, err)
-		}
-		return
-	}
-
-	ecb.wg.Add(1)
-	go func() {
-		if err := f(); err != nil {
-			ecb.wgErrors = append(ecb.wgErrors, err)
-		}
-		ecb.wg.Done()
-	}()
-}
-
-func (ecb *ecBalancer) wgWait() error {
-	if ecb.wg != nil {
-		ecb.wg.Wait()
-	}
-	err := errors.Join(ecb.wgErrors...)
-	ecb.wg = nil
-	ecb.wgErrors = nil
-
-	return err
+func (ecb *ecBalancer) errorWaitGroup() *ErrorWaitGroup {
+	return NewErrorWaitGroup(ecb.maxParallelization)
 }
 
 func (ecb *ecBalancer) racks() map[RackId]*EcRack {
@@ -637,13 +647,13 @@ func (ecb *ecBalancer) balanceEcVolumes(collection string) error {
 func (ecb *ecBalancer) deleteDuplicatedEcShards(collection string) error {
 	vidLocations := ecb.collectVolumeIdToEcNodes(collection)
 
-	ecb.wgInit()
+	ewg := ecb.errorWaitGroup()
 	for vid, locations := range vidLocations {
-		ecb.wgAdd(func() error {
+		ewg.Add(func() error {
 			return ecb.doDeduplicateEcShards(collection, vid, locations)
 		})
 	}
-	return ecb.wgWait()
+	return ewg.Wait()
 }
 
 func (ecb *ecBalancer) doDeduplicateEcShards(collection string, vid needle.VolumeId, locations []*EcNode) error {
@@ -684,13 +694,13 @@ func (ecb *ecBalancer) balanceEcShardsAcrossRacks(collection string) error {
 	vidLocations := ecb.collectVolumeIdToEcNodes(collection)
 
 	// spread the ec shards evenly
-	ecb.wgInit()
+	ewg := ecb.errorWaitGroup()
 	for vid, locations := range vidLocations {
-		ecb.wgAdd(func() error {
+		ewg.Add(func() error {
 			return ecb.doBalanceEcShardsAcrossRacks(collection, vid, locations)
 		})
 	}
-	return ecb.wgWait()
+	return ewg.Wait()
 }
 
 func countShardsByRack(vid needle.VolumeId, locations []*EcNode) map[string]int {
@@ -792,7 +802,7 @@ func (ecb *ecBalancer) balanceEcShardsWithinRacks(collection string) error {
 	racks := ecb.racks()
 
 	// spread the ec shards evenly
-	ecb.wgInit()
+	ewg := ecb.errorWaitGroup()
 	for vid, locations := range vidLocations {
 
 		// see the volume's shards are in how many racks, and how many in each rack
@@ -811,12 +821,12 @@ func (ecb *ecBalancer) balanceEcShardsWithinRacks(collection string) error {
 			}
 			sourceEcNodes := rackEcNodesWithVid[rackId]
 			averageShardsPerEcNode := ceilDivide(rackToShardCount[rackId], len(possibleDestinationEcNodes))
-			ecb.wgAdd(func() error {
+			ewg.Add(func() error {
 				return ecb.doBalanceEcShardsWithinOneRack(averageShardsPerEcNode, collection, vid, sourceEcNodes, possibleDestinationEcNodes)
 			})
 		}
 	}
-	return ecb.wgWait()
+	return ewg.Wait()
 }
 
 func (ecb *ecBalancer) doBalanceEcShardsWithinOneRack(averageShardsPerEcNode int, collection string, vid needle.VolumeId, existingLocations, possibleDestinationEcNodes []*EcNode) error {
@@ -847,13 +857,13 @@ func (ecb *ecBalancer) doBalanceEcShardsWithinOneRack(averageShardsPerEcNode int
 
 func (ecb *ecBalancer) balanceEcRacks() error {
 	// balance one rack for all ec shards
-	ecb.wgInit()
+	ewg := ecb.errorWaitGroup()
 	for _, ecRack := range ecb.racks() {
-		ecb.wgAdd(func() error {
+		ewg.Add(func() error {
 			return ecb.doBalanceEcRack(ecRack)
 		})
 	}
-	return ecb.wgWait()
+	return ewg.Wait()
 }
 
 func (ecb *ecBalancer) doBalanceEcRack(ecRack *EcRack) error {
@@ -1048,7 +1058,7 @@ func (ecb *ecBalancer) collectVolumeIdToEcNodes(collection string) map[needle.Vo
 	return vidLocations
 }
 
-func EcBalance(commandEnv *CommandEnv, collections []string, dc string, ecReplicaPlacement *super_block.ReplicaPlacement, parallelize bool, applyBalancing bool) (err error) {
+func EcBalance(commandEnv *CommandEnv, collections []string, dc string, ecReplicaPlacement *super_block.ReplicaPlacement, maxParallelization int, applyBalancing bool) (err error) {
 	if len(collections) == 0 {
 		return fmt.Errorf("no collections to balance")
 	}
@@ -1063,11 +1073,11 @@ func EcBalance(commandEnv *CommandEnv, collections []string, dc string, ecReplic
 	}
 
 	ecb := &ecBalancer{
-		commandEnv:       commandEnv,
-		ecNodes:          allEcNodes,
-		replicaPlacement: ecReplicaPlacement,
-		applyBalancing:   applyBalancing,
-		parallelize:      parallelize,
+		commandEnv:         commandEnv,
+		ecNodes:            allEcNodes,
+		replicaPlacement:   ecReplicaPlacement,
+		applyBalancing:     applyBalancing,
+		maxParallelization: maxParallelization,
 	}
 
 	for _, c := range collections {
