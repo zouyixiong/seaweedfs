@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -19,7 +20,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"google.golang.org/grpc"
-	"slices"
 )
 
 type DataCenterId string
@@ -176,20 +176,25 @@ func _getDefaultReplicaPlacement(commandEnv *CommandEnv) (*super_block.ReplicaPl
 }
 
 func parseReplicaPlacementArg(commandEnv *CommandEnv, replicaStr string) (*super_block.ReplicaPlacement, error) {
-	if replicaStr != "" {
-		rp, err := super_block.NewReplicaPlacementFromString(replicaStr)
-		if err == nil {
-			fmt.Printf("using replica placement %q for EC volumes\n", rp.String())
-		}
-		return rp, err
-	}
+	var rp *super_block.ReplicaPlacement
+	var err error
 
-	// No replica placement argument provided, resolve from master default settings.
-	rp, err := getDefaultReplicaPlacement(commandEnv)
-	if err == nil {
+	if replicaStr != "" {
+		rp, err = super_block.NewReplicaPlacementFromString(replicaStr)
+		if err != nil {
+			return rp, err
+		}
+		fmt.Printf("using replica placement %q for EC volumes\n", rp.String())
+	} else {
+		// No replica placement argument provided, resolve from master default settings.
+		rp, err = getDefaultReplicaPlacement(commandEnv)
+		if err != nil {
+			return rp, err
+		}
 		fmt.Printf("using master default replica placement %q for EC volumes\n", rp.String())
 	}
-	return rp, err
+
+	return rp, nil
 }
 
 func collectTopologyInfo(commandEnv *CommandEnv, delayBeforeCollecting time.Duration) (topoInfo *master_pb.TopologyInfo, volumeSizeLimitMb uint64, err error) {
@@ -775,8 +780,8 @@ func (ecb *ecBalancer) pickRackToBalanceShardsInto(rackToEcNodes map[RackId]*EcR
 			details += fmt.Sprintf("  Skipped %s because it has no free slots\n", rackId)
 			continue
 		}
-		if ecb.replicaPlacement != nil && shards >= ecb.replicaPlacement.DiffRackCount {
-			details += fmt.Sprintf("  Skipped %s because shards %d >= replica placement limit for other racks (%d)\n", rackId, shards, ecb.replicaPlacement.DiffRackCount)
+		if ecb.replicaPlacement != nil && shards > ecb.replicaPlacement.DiffRackCount {
+			details += fmt.Sprintf("  Skipped %s because shards %d > replica placement limit for other racks (%d)\n", rackId, shards, ecb.replicaPlacement.DiffRackCount)
 			continue
 		}
 
@@ -969,8 +974,8 @@ func (ecb *ecBalancer) pickEcNodeToBalanceShardsInto(vid needle.VolumeId, existi
 		}
 
 		shards := nodeShards[node]
-		if ecb.replicaPlacement != nil && shards >= ecb.replicaPlacement.SameRackCount {
-			details += fmt.Sprintf("  Skipped %s because shards %d >= replica placement limit for the rack (%d)\n", node.info.Id, shards, ecb.replicaPlacement.SameRackCount)
+		if ecb.replicaPlacement != nil && shards > ecb.replicaPlacement.SameRackCount {
+			details += fmt.Sprintf("  Skipped %s because shards %d > replica placement limit for the rack (%d)\n", node.info.Id, shards, ecb.replicaPlacement.SameRackCount)
 			continue
 		}
 
@@ -1059,10 +1064,6 @@ func (ecb *ecBalancer) collectVolumeIdToEcNodes(collection string) map[needle.Vo
 }
 
 func EcBalance(commandEnv *CommandEnv, collections []string, dc string, ecReplicaPlacement *super_block.ReplicaPlacement, maxParallelization int, applyBalancing bool) (err error) {
-	if len(collections) == 0 {
-		return fmt.Errorf("no collections to balance")
-	}
-
 	// collect all ec nodes
 	allEcNodes, totalFreeEcSlots, err := collectEcNodesForDC(commandEnv, dc)
 	if err != nil {
@@ -1080,11 +1081,15 @@ func EcBalance(commandEnv *CommandEnv, collections []string, dc string, ecReplic
 		maxParallelization: maxParallelization,
 	}
 
+	if len(collections) == 0 {
+		fmt.Printf("WARNING: No collections to balance EC volumes across.")
+	}
 	for _, c := range collections {
 		if err = ecb.balanceEcVolumes(c); err != nil {
 			return err
 		}
 	}
+
 	if err := ecb.balanceEcRacks(); err != nil {
 		return fmt.Errorf("balance ec racks: %v", err)
 	}
