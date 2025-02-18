@@ -104,16 +104,16 @@ require (
 	gocloud.dev v0.40.0
 	gocloud.dev/pubsub/natspubsub v0.40.0
 	gocloud.dev/pubsub/rabbitpubsub v0.40.0
-	golang.org/x/crypto v0.32.0 // indirect
+	golang.org/x/crypto v0.33.0 // indirect
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56
 	golang.org/x/image v0.23.0
-	golang.org/x/net v0.34.0
-	golang.org/x/oauth2 v0.25.0 // indirect
-	golang.org/x/sys v0.29.0
-	golang.org/x/text v0.21.0 // indirect
-	golang.org/x/tools v0.29.0
+	golang.org/x/net v0.35.0
+	golang.org/x/oauth2 v0.26.0 // indirect
+	golang.org/x/sys v0.30.0
+	golang.org/x/text v0.22.0 // indirect
+	golang.org/x/tools v0.30.0
 	golang.org/x/xerrors v0.0.0-20240716161551-93cc26a95ae9 // indirect
-	google.golang.org/api v0.218.0
+	google.golang.org/api v0.221.0
 	google.golang.org/genproto v0.0.0-20250122153221-138b5a5a4fd4 // indirect
 	google.golang.org/grpc v1.70.0
 	google.golang.org/protobuf v1.36.5
@@ -131,7 +131,7 @@ require (
 	github.com/armon/go-metrics v0.4.1
 	github.com/aws/aws-sdk-go-v2 v1.36.1
 	github.com/aws/aws-sdk-go-v2/config v1.29.1
-	github.com/aws/aws-sdk-go-v2/credentials v1.17.54
+	github.com/aws/aws-sdk-go-v2/credentials v1.17.59
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.76.0
 	github.com/cognusion/imaging v1.0.1
 	github.com/fluent/fluent-logger-golang v1.9.0
@@ -151,7 +151,7 @@ require (
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/tikv/client-go/v2 v2.0.7
 	github.com/ydb-platform/ydb-go-sdk-auth-environ v0.5.0
-	github.com/ydb-platform/ydb-go-sdk/v3 v3.98.0
+	github.com/ydb-platform/ydb-go-sdk/v3 v3.99.10
 	go.etcd.io/etcd/client/pkg/v3 v3.5.18
 	go.uber.org/atomic v1.11.0
 	golang.org/x/sync v0.11.0
@@ -160,7 +160,7 @@ require (
 
 require (
 	cel.dev/expr v0.19.0 // indirect
-	cloud.google.com/go/auth v0.14.0 // indirect
+	cloud.google.com/go/auth v0.14.1 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.7 // indirect
 	cloud.google.com/go/compute/metadata v0.6.0 // indirect
 	cloud.google.com/go/iam v1.3.1 // indirect
@@ -192,7 +192,7 @@ require (
 	github.com/appscode/go-querystring v0.0.0-20170504095604-0126cfb3f1dc // indirect
 	github.com/arangodb/go-velocypack v0.0.0-20200318135517-5af53c29c67e // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.8 // indirect
-	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.24 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.28 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.17.10 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.3.32 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.6.32 // indirect
@@ -204,9 +204,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.18.13 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sns v1.31.3 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.34.3 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sso v1.24.11 // indirect
-	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.28.10 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sts v1.33.9 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sso v1.24.15 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.28.14 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sts v1.33.14 // indirect
 	github.com/aws/smithy-go v1.22.2 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/bradenaw/juniper v0.15.2 // indirect
@@ -349,11 +349,11 @@ require (
 	go.opentelemetry.io/otel/trace v1.34.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
-	golang.org/x/mod v0.22.0 // indirect
-	golang.org/x/term v0.28.0 // indirect
-	golang.org/x/time v0.9.0 // indirect
+	golang.org/x/mod v0.23.0 // indirect
+	golang.org/x/term v0.29.0 // indirect
+	golang.org/x/time v0.10.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20250124145028-65684f501c47 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20250124145028-65684f501c47 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20250207221924-e9438ea467c6 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/validator.v2 v2.0.1 // indirect
