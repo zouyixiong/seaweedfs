@@ -54,6 +54,10 @@ enabled = false
 # dsn will take priority over "hostname, port, username, password, database".
 # [username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]
 dsn = "root@tcp(localhost:3306)/seaweedfs?collation=utf8mb4_bin"
+enable_tls = false
+ca_crt = ""                # ca.crt dir when enable_tls set true
+client_crt = ""            # mysql client.crt dir when enable_tls set true
+client_key = ""            # mysql client.key dir when enable_tls set true
 hostname = "localhost"
 port = 3306
 username = "root"
@@ -139,12 +143,13 @@ connection_max_lifetime_seconds = 0
 enableUpsert = true
 upsertQuery = """UPSERT INTO "%[1]s" (dirhash,name,directory,meta) VALUES($1,$2,$3,$4)"""
 
-[cassandra]
+[cassandra2]
 # CREATE TABLE filemeta (
+#    dirhash bigint,
 #    directory varchar,
 #    name varchar,
 #    meta blob,
-#    PRIMARY KEY (directory, name)
+#    PRIMARY KEY ((dirhash, directory), name)
 # ) WITH CLUSTERING ORDER BY (name ASC);
 enabled = false
 keyspace = "seaweedfs"
@@ -170,6 +175,10 @@ enabled = false
 address = "localhost:6379"
 password = ""
 database = 0
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 
@@ -180,6 +189,10 @@ masterName = "master"
 username = ""
 password = ""
 database = 0
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 
 [redis_cluster2]
 enabled = false
@@ -192,6 +205,10 @@ addresses = [
     "localhost:30006",
 ]
 password = ""
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # allows reads from slave servers or the master, but all writes still go to the master
 readOnly = false
 # automatically use the closest Redis server for reads
@@ -199,11 +216,16 @@ routeByLatency = false
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 
+# The following lua redis stores uses lua to ensure atomicity
 [redis_lua]
 enabled = false
 address = "localhost:6379"
 password = ""
 database = 0
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 
@@ -214,6 +236,10 @@ masterName = "master"
 username = ""
 password = ""
 database = 0
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 
 [redis_lua_cluster]
 enabled = false
@@ -226,42 +252,16 @@ addresses = [
     "localhost:30006",
 ]
 password = ""
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # allows reads from slave servers or the master, but all writes still go to the master
 readOnly = false
 # automatically use the closest Redis server for reads
 routeByLatency = false
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
-
-[redis3] # beta
-enabled = false
-address = "localhost:6379"
-password = ""
-database = 0
-
-[redis3_sentinel]
-enabled = false
-addresses = ["172.22.12.7:26379","172.22.12.8:26379","172.22.12.9:26379"]
-masterName = "master"
-username = ""
-password = ""
-database = 0
-
-[redis_cluster3] # beta
-enabled = false
-addresses = [
-    "localhost:30001",
-    "localhost:30002",
-    "localhost:30003",
-    "localhost:30004",
-    "localhost:30005",
-    "localhost:30006",
-]
-password = ""
-# allows reads from slave servers or the master, but all writes still go to the master
-readOnly = false
-# automatically use the closest Redis server for reads
-routeByLatency = false
 
 [etcd]
 enabled = false
@@ -333,7 +333,7 @@ dialTimeOut = 10
 ##########################
 # To add path-specific filer store:
 #
-# 1. Add a name following the store type separated by a dot ".". E.g., cassandra.tmp
+# 1. Add a name following the store type separated by a dot ".". E.g., cassandra2.tmp
 # 2. Add a location configuration. E.g., location = "/tmp/"
 # 3. Copy and customize all other configurations.
 #     Make sure they are not the same if using the same store type!
@@ -365,3 +365,10 @@ cert_path=""
 key_path=""
 # The name list used to verify the cn name
 verify_cn=""
+
+[tarantool]
+address = "localhost:3301"
+user = "guest"
+password = ""
+timeout = "5s"
+maxReconnects = 1000
