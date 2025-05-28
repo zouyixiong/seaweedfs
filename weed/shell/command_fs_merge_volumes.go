@@ -90,7 +90,7 @@ func (c *commandFsMergeVolumes) Do(args []string, commandEnv *CommandEnv, writer
 				"volume %d (%d MB) cannot merge into volume %d (%d MB_ due to volume size limit (%d MB)",
 				fromVolumeId, fromSize/1024/1024,
 				toVolumeId, toSize/1024/1024,
-				c.volumeSizeLimit/1024/102,
+				c.volumeSizeLimit/1024/1024,
 			)
 		}
 	}
@@ -134,7 +134,7 @@ func (c *commandFsMergeVolumes) Do(args []string, commandEnv *CommandEnv, writer
 					continue
 				}
 
-				if err = filer_pb.UpdateEntry(filerClient, &filer_pb.UpdateEntryRequest{
+				if err = filer_pb.UpdateEntry(context.Background(), filerClient, &filer_pb.UpdateEntryRequest{
 					Directory: string(parentPath),
 					Entry:     entry,
 				}); err != nil {

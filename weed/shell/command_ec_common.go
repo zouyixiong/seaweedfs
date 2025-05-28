@@ -7,7 +7,6 @@ import (
 	"math/rand/v2"
 	"slices"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -113,53 +112,6 @@ var (
 	getDefaultReplicaPlacement = _getDefaultReplicaPlacement
 )
 
-type ErrorWaitGroup struct {
-	maxConcurrency int
-	wg             *sync.WaitGroup
-	wgSem          chan bool
-	errors         []error
-	errorsMu       sync.Mutex
-}
-type ErrorWaitGroupTask func() error
-
-func NewErrorWaitGroup(maxConcurrency int) *ErrorWaitGroup {
-	if maxConcurrency <= 0 {
-		// No concurrency = one task at the time
-		maxConcurrency = 1
-	}
-	return &ErrorWaitGroup{
-		maxConcurrency: maxConcurrency,
-		wg:             &sync.WaitGroup{},
-		wgSem:          make(chan bool, maxConcurrency),
-	}
-}
-
-func (ewg *ErrorWaitGroup) Add(f ErrorWaitGroupTask) {
-	if ewg.maxConcurrency <= 1 {
-		// Keep run order deterministic when parallelization is off
-		ewg.errors = append(ewg.errors, f())
-		return
-	}
-
-	ewg.wg.Add(1)
-	go func() {
-		ewg.wgSem <- true
-
-		err := f()
-		ewg.errorsMu.Lock()
-		ewg.errors = append(ewg.errors, err)
-		ewg.errorsMu.Unlock()
-
-		<-ewg.wgSem
-		ewg.wg.Done()
-	}()
-}
-
-func (ewg *ErrorWaitGroup) Wait() error {
-	ewg.wg.Wait()
-	return errors.Join(ewg.errors...)
-}
-
 func _getDefaultReplicaPlacement(commandEnv *CommandEnv) (*super_block.ReplicaPlacement, error) {
 	var resp *master_pb.GetMasterConfigurationResponse
 	var err error
@@ -248,14 +200,14 @@ func collectCollectionsForVolumeIds(t *master_pb.TopologyInfo, vids []needle.Vol
 				for _, diskInfo := range dn.DiskInfos {
 					for _, vi := range diskInfo.VolumeInfos {
 						for _, vid := range vids {
-							if needle.VolumeId(vi.Id) == vid && vi.Collection != "" {
+							if needle.VolumeId(vi.Id) == vid {
 								found[vi.Collection] = true
 							}
 						}
 					}
 					for _, ecs := range diskInfo.EcShardInfos {
 						for _, vid := range vids {
-							if needle.VolumeId(ecs.Id) == vid && ecs.Collection != "" {
+							if needle.VolumeId(ecs.Id) == vid {
 								found[ecs.Collection] = true
 							}
 						}
@@ -429,7 +381,13 @@ func countFreeShardSlots(dn *master_pb.DataNodeInfo, diskType types.DiskType) (c
 	if diskInfo == nil {
 		return 0
 	}
-	return int(diskInfo.MaxVolumeCount-diskInfo.VolumeCount)*erasure_coding.DataShardsCount - countShards(diskInfo.EcShardInfos)
+
+	slots := int(diskInfo.MaxVolumeCount-diskInfo.VolumeCount)*erasure_coding.DataShardsCount - countShards(diskInfo.EcShardInfos)
+	if slots < 0 {
+		return 0
+	}
+
+	return slots
 }
 
 func (ecNode *EcNode) localShardIdCount(vid uint32) int {
