@@ -32,28 +32,6 @@ type bufferReader struct {
 	i int64
 }
 
-func NewBufferReader(b []byte) *bufferReader { return &bufferReader{b: b} }
-
-func (r *bufferReader) Read(p []byte) (int, error) {
-	if r.i >= int64(len(r.b)) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.b[r.i:])
-	r.i += int64(n)
-	return n, nil
-}
-
-func (r *bufferReader) ReadAt(p []byte, off int64) (int, error) {
-	if off >= int64(len(r.b)) {
-		return 0, io.EOF
-	}
-	n := copy(p, r.b[off:])
-	if n < len(p) {
-		return n, io.EOF
-	}
-	return n, nil
-}
-
 // listerat implements sftp.ListerAt.
 type listerat []os.FileInfo
 
@@ -72,6 +50,7 @@ func (l listerat) ListAt(ls []os.FileInfo, offset int64) (int, error) {
 type SeaweedSftpFileWriter struct {
 	fs          SftpServer
 	req         *sftp.Request
+	absPath     string // Absolute path after HomeDir translation
 	mu          sync.Mutex
 	tmpFile     *os.File
 	permissions os.FileMode
@@ -105,6 +84,6 @@ func (w *SeaweedSftpFileWriter) Close() error {
 		return err
 	}
 
-	// Stream the file instead of loading it
-	return w.fs.putFile(w.req.Filepath, w.tmpFile, w.fs.user)
+	// Stream the file to the absolute path (after HomeDir translation)
+	return w.fs.putFile(w.absPath, w.tmpFile, w.fs.user)
 }

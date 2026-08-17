@@ -1,7 +1,10 @@
 package filer
 
 import (
+	"context"
 	"fmt"
+	"strings"
+
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
@@ -9,20 +12,35 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// FindMountedRemoteMapping returns the mount point covering dir and its remote
+// location. Matches on path components so a sibling name sharing a prefix does
+// not collide, and the longest mount wins when mounts nest.
+func FindMountedRemoteMapping(mappings *remote_pb.RemoteStorageMapping, dir string) (localMountedDir string, remoteStorageMountedLocation *remote_pb.RemoteStorageLocation, err error) {
+	for k, loc := range mappings.Mappings {
+		if (dir == k || strings.HasPrefix(dir, strings.TrimSuffix(k, "/")+"/")) && len(k) > len(localMountedDir) {
+			localMountedDir, remoteStorageMountedLocation = k, loc
+		}
+	}
+	if localMountedDir == "" {
+		return "", nil, fmt.Errorf("%s is not mounted", dir)
+	}
+	return
+}
+
 func ReadMountMappings(grpcDialOption grpc.DialOption, filerAddress pb.ServerAddress) (mappings *remote_pb.RemoteStorageMapping, readErr error) {
 	var oldContent []byte
 	if readErr = pb.WithFilerClient(false, 0, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
-		oldContent, readErr = ReadInsideFiler(client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE)
+		oldContent, readErr = ReadInsideFiler(context.Background(), client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE)
 		return readErr
 	}); readErr != nil {
 		if readErr != filer_pb.ErrNotFound {
-			return nil, fmt.Errorf("read existing mapping: %v", readErr)
+			return nil, fmt.Errorf("read existing mapping: %w", readErr)
 		}
 		oldContent = nil
 	}
 	mappings, readErr = UnmarshalRemoteStorageMappings(oldContent)
 	if readErr != nil {
-		return nil, fmt.Errorf("unmarshal mappings: %v", readErr)
+		return nil, fmt.Errorf("unmarshal mappings: %w", readErr)
 	}
 
 	return
@@ -33,12 +51,12 @@ func InsertMountMapping(filerClient filer_pb.FilerClient, dir string, remoteStor
 	// read current mapping
 	var oldContent, newContent []byte
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		oldContent, err = ReadInsideFiler(client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE)
+		oldContent, err = ReadInsideFiler(context.Background(), client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE)
 		return err
 	})
 	if err != nil {
 		if err != filer_pb.ErrNotFound {
-			return fmt.Errorf("read existing mapping: %v", err)
+			return fmt.Errorf("read existing mapping: %w", err)
 		}
 	}
 
@@ -50,10 +68,10 @@ func InsertMountMapping(filerClient filer_pb.FilerClient, dir string, remoteStor
 
 	// save back
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		return SaveInsideFiler(client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE, newContent)
+		return SaveInsideFiler(context.Background(), client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE, newContent)
 	})
 	if err != nil {
-		return fmt.Errorf("save mapping: %v", err)
+		return fmt.Errorf("save mapping: %w", err)
 	}
 
 	return nil
@@ -64,12 +82,12 @@ func DeleteMountMapping(filerClient filer_pb.FilerClient, dir string) (err error
 	// read current mapping
 	var oldContent, newContent []byte
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		oldContent, err = ReadInsideFiler(client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE)
+		oldContent, err = ReadInsideFiler(context.Background(), client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE)
 		return err
 	})
 	if err != nil {
 		if err != filer_pb.ErrNotFound {
-			return fmt.Errorf("read existing mapping: %v", err)
+			return fmt.Errorf("read existing mapping: %w", err)
 		}
 	}
 
@@ -81,10 +99,10 @@ func DeleteMountMapping(filerClient filer_pb.FilerClient, dir string) (err error
 
 	// save back
 	err = filerClient.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-		return SaveInsideFiler(client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE, newContent)
+		return SaveInsideFiler(context.Background(), client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE, newContent)
 	})
 	if err != nil {
-		return fmt.Errorf("save mapping: %v", err)
+		return fmt.Errorf("save mapping: %w", err)
 	}
 
 	return nil
@@ -100,7 +118,7 @@ func addRemoteStorageMapping(oldContent []byte, dir string, storageLocation *rem
 	mappings.Mappings[dir] = storageLocation
 
 	if newContent, err = proto.Marshal(mappings); err != nil {
-		return oldContent, fmt.Errorf("marshal mappings: %v", err)
+		return oldContent, fmt.Errorf("marshal mappings: %w", err)
 	}
 
 	return
@@ -116,7 +134,7 @@ func removeRemoteStorageMapping(oldContent []byte, dir string) (newContent []byt
 	delete(mappings.Mappings, dir)
 
 	if newContent, err = proto.Marshal(mappings); err != nil {
-		return oldContent, fmt.Errorf("marshal mappings: %v", err)
+		return oldContent, fmt.Errorf("marshal mappings: %w", err)
 	}
 
 	return

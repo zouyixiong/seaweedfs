@@ -3,6 +3,7 @@ package redis3
 import (
 	"context"
 	"fmt"
+
 	"github.com/redis/go-redis/v9"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 )
@@ -31,7 +32,7 @@ func insertChild(ctx context.Context, redisStore *UniversalRedis3Store, key stri
 	nameList := LoadItemList([]byte(data), key, client, store, maxNameBatchSizeLimit)
 
 	if err := nameList.WriteName(name); err != nil {
-		glog.Errorf("add %s %s: %v", key, name, err)
+		glog.ErrorfCtx(ctx, "add %s %s: %v", key, name, err)
 		return err
 	}
 
@@ -69,7 +70,19 @@ func removeChild(ctx context.Context, redisStore *UniversalRedis3Store, key stri
 		return err
 	}
 	if !nameList.HasChanges() {
+		// Nothing to remove. If the list is empty anyway, its header outlived the
+		// removal of the last name - a delete that failed here before - so take it
+		// now rather than leaving the key behind for good.
+		if nameList.IsEmpty() {
+			return client.Del(ctx, key).Err()
+		}
 		return nil
+	}
+
+	// An emptied list reads the same as no list at all, and keeping the header would
+	// leave a key behind for every directory that is emptied.
+	if nameList.IsEmpty() {
+		return client.Del(ctx, key).Err()
 	}
 
 	if err := client.Set(ctx, key, nameList.ToBytes(), 0).Err(); err != nil {
@@ -100,7 +113,7 @@ func removeChildren(ctx context.Context, redisStore *UniversalRedis3Store, key s
 
 	if err = nameList.ListNames("", func(name string) bool {
 		if err := onDeleteFn(name); err != nil {
-			glog.Errorf("delete %s child %s: %v", key, name, err)
+			glog.ErrorfCtx(ctx, "delete %s child %s: %v", key, name, err)
 			return false
 		}
 		return true

@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -36,6 +37,10 @@ func (c *commandFsMetaNotify) HasTag(CommandTag) bool {
 
 func (c *commandFsMetaNotify) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
+	if handleHelpRequest(c, args, writer) {
+		return nil
+	}
+
 	path, err := commandEnv.parseUrl(findInputDirectory(args))
 	if err != nil {
 		return err
@@ -47,7 +52,7 @@ func (c *commandFsMetaNotify) Do(args []string, commandEnv *CommandEnv, writer i
 
 	var dirCount, fileCount uint64
 
-	err = filer_pb.TraverseBfs(commandEnv, util.FullPath(path), func(parentPath util.FullPath, entry *filer_pb.Entry) {
+	err = filer_pb.TraverseBfs(context.Background(), commandEnv, util.FullPath(path), func(parentPath util.FullPath, entry *filer_pb.Entry) error {
 
 		if entry.IsDirectory {
 			dirCount++
@@ -65,7 +70,7 @@ func (c *commandFsMetaNotify) Do(args []string, commandEnv *CommandEnv, writer i
 		if notifyErr != nil {
 			fmt.Fprintf(writer, "fail to notify new entry event for %s: %v\n", parentPath.Child(entry.Name), notifyErr)
 		}
-
+		return nil
 	})
 
 	if err == nil {

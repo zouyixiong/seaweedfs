@@ -9,6 +9,7 @@ import (
 )
 
 var Commands = []*Command{
+	cmdAdmin,
 	cmdAutocomplete,
 	cmdUnautocomplete,
 	cmdBackup,
@@ -21,19 +22,23 @@ var Commands = []*Command{
 	cmdFilerCat,
 	cmdFilerCopy,
 	cmdFilerMetaBackup,
+	cmdFilerMetaScan,
 	cmdFilerMetaTail,
 	cmdFilerRemoteGateway,
 	cmdFilerRemoteSynchronize,
 	cmdFilerReplicate,
 	cmdFilerSynchronize,
+	cmdFilerSyncVerify,
 	cmdFix,
 	cmdFuse,
 	cmdIam,
 	cmdMaster,
 	cmdMasterFollower,
+	cmdMini,
 	cmdMount,
 	cmdMqAgent,
 	cmdMqBroker,
+	cmdMqKafkaGateway,
 	cmdS3,
 	cmdScaffold,
 	cmdServer,
@@ -44,6 +49,7 @@ var Commands = []*Command{
 	cmdVolume,
 	cmdWebDav,
 	cmdSftp,
+	cmdWorker,
 }
 
 type Command struct {

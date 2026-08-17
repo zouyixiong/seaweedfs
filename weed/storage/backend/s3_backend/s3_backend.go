@@ -129,6 +129,20 @@ type S3BackendStorageFile struct {
 }
 
 func (s3backendStorageFile S3BackendStorageFile) ReadAt(p []byte, off int64) (n int, err error) {
+	if off < 0 {
+		return 0, fmt.Errorf("negative offset %d", off)
+	}
+
+	requested := len(p)
+	if requested == 0 {
+		return 0, nil
+	}
+
+	datSize, _, _ := s3backendStorageFile.GetStat()
+
+	if datSize > 0 && off >= datSize {
+		return 0, io.EOF
+	}
 
 	bytesRange := fmt.Sprintf("bytes=%d-%d", off, off+int64(len(p))-1)
 
@@ -149,6 +163,9 @@ func (s3backendStorageFile S3BackendStorageFile) ReadAt(p []byte, off int64) (n 
 	var readCount int
 	for {
 		p = p[readCount:]
+		if len(p) == 0 {
+			break
+		}
 		readCount, err = getObjectOutput.Body.Read(p)
 		n += readCount
 
@@ -157,7 +174,7 @@ func (s3backendStorageFile S3BackendStorageFile) ReadAt(p []byte, off int64) (n 
 		}
 	}
 
-	if err == io.EOF {
+	if err == io.EOF && n == requested {
 		err = nil
 	}
 

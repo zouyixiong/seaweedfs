@@ -3,10 +3,11 @@ package shell
 import (
 	"context"
 	"fmt"
+	"io"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"io"
 )
 
 func init() {
@@ -32,6 +33,10 @@ func (c *commandFsCat) HasTag(CommandTag) bool {
 }
 
 func (c *commandFsCat) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
+
+	if handleHelpRequest(c, args, writer) {
+		return nil
+	}
 
 	path, err := commandEnv.parseUrl(findInputDirectory(args))
 	if err != nil {

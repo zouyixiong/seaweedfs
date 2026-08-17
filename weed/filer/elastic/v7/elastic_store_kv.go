@@ -1,5 +1,4 @@
 //go:build elastic
-// +build elastic
 
 package elastic
 
@@ -25,8 +24,8 @@ func (store *ElasticStore) KvDelete(ctx context.Context, key []byte) (err error)
 			return nil
 		}
 	}
-	glog.Errorf("delete key(id:%s) %v.", string(key), err)
-	return fmt.Errorf("delete key %v", err)
+	glog.ErrorfCtx(ctx, "delete key(id:%s) %v.", string(key), err)
+	return fmt.Errorf("delete key %w", err)
 }
 
 func (store *ElasticStore) KvGet(ctx context.Context, key []byte) (value []byte, err error) {
@@ -56,8 +55,8 @@ func (store *ElasticStore) KvPut(ctx context.Context, key []byte, value []byte) 
 	esEntry := &ESKVEntry{value}
 	val, err := jsoniter.Marshal(esEntry)
 	if err != nil {
-		glog.Errorf("insert key(%s) %v.", string(key), err)
-		return fmt.Errorf("insert key %v", err)
+		glog.ErrorfCtx(ctx, "insert key(%s) %v.", string(key), err)
+		return fmt.Errorf("insert key %w", err)
 	}
 	_, err = store.client.Index().
 		Index(indexKV).
@@ -66,7 +65,7 @@ func (store *ElasticStore) KvPut(ctx context.Context, key []byte, value []byte) 
 		BodyJson(string(val)).
 		Do(ctx)
 	if err != nil {
-		return fmt.Errorf("kv put: %v", err)
+		return fmt.Errorf("kv put: %w", err)
 	}
 	return nil
 }

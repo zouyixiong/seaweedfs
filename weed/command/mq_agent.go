@@ -3,6 +3,7 @@ package command
 import (
 	"github.com/seaweedfs/seaweedfs/weed/mq/agent"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_agent_pb"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -60,15 +61,33 @@ func (mqAgentOpt *MessageQueueAgentOptions) startQueueAgent() bool {
 	}, grpcDialOption)
 
 	// start grpc listener
-	grpcL, _, err := util.NewIpAndLocalListeners(*mqAgentOpt.ip, *mqAgentOpt.port, 0)
+	grpcL, localL, err := util.NewIpAndLocalListeners(*mqAgentOpt.ip, *mqAgentOpt.port, 0)
 	if err != nil {
 		glog.Fatalf("failed to listen on grpc port %d: %v", *mqAgentOpt.port, err)
 	}
-	glog.Infof("Start Seaweed Message Queue Agent on %s:%d", *mqAgentOpt.ip, *mqAgentOpt.port)
+
+	// Create main gRPC server
 	grpcS := pb.NewGrpcServer()
 	mq_agent_pb.RegisterSeaweedMessagingAgentServer(grpcS, agentServer)
 	reflection.Register(grpcS)
-	grpcS.Serve(grpcL)
+
+	// Start localhost listener if available
+	if localL != nil {
+		localGrpcS := pb.NewGrpcServer()
+		mq_agent_pb.RegisterSeaweedMessagingAgentServer(localGrpcS, agentServer)
+		reflection.Register(localGrpcS)
+		go func() {
+			glog.V(0).Infof("MQ Agent listening on localhost:%d", *mqAgentOpt.port)
+			if err := localGrpcS.Serve(localL); err != nil {
+				glog.Errorf("MQ Agent localhost listener error: %v", err)
+			}
+		}()
+	}
+
+	glog.Infof("Start Seaweed Message Queue Agent on %s:%d", *mqAgentOpt.ip, *mqAgentOpt.port)
+	if err := grpcS.Serve(grpcL); err != nil && err != grpc.ErrServerStopped {
+		glog.Errorf("MQ Agent failed to start: %v", err)
+	}
 
 	return true
 

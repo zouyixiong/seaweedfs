@@ -29,25 +29,32 @@ func newPageWriter(fh *FileHandle, chunkSize int64) *PageWriter {
 	return pw
 }
 
-func (pw *PageWriter) AddPage(offset int64, data []byte, isSequential bool, tsNs int64) {
+func (pw *PageWriter) AddPage(offset int64, data []byte, isSequential bool, tsNs int64) error {
 
 	glog.V(4).Infof("%v AddPage [%d, %d)", pw.fh.fh, offset, offset+int64(len(data)))
 
 	chunkIndex := offset / pw.chunkSize
 	for i := chunkIndex; len(data) > 0; i++ {
 		writeSize := min(int64(len(data)), (i+1)*pw.chunkSize-offset)
-		pw.addToOneChunk(i, offset, data[:writeSize], isSequential, tsNs)
+		if err := pw.addToOneChunk(i, offset, data[:writeSize], isSequential, tsNs); err != nil {
+			return err
+		}
 		offset += writeSize
 		data = data[writeSize:]
 	}
+	return nil
 }
 
-func (pw *PageWriter) addToOneChunk(chunkIndex, offset int64, data []byte, isSequential bool, tsNs int64) {
-	pw.randomWriter.AddPage(offset, data, isSequential, tsNs)
+func (pw *PageWriter) addToOneChunk(chunkIndex, offset int64, data []byte, isSequential bool, tsNs int64) error {
+	return pw.randomWriter.AddPage(offset, data, isSequential, tsNs)
 }
 
 func (pw *PageWriter) FlushData() error {
 	return pw.randomWriter.FlushData()
+}
+
+func (pw *PageWriter) HasWrites() bool {
+	return pw.randomWriter.HasWrites()
 }
 
 func (pw *PageWriter) ReadDirtyDataAt(data []byte, offset int64, tsNs int64) (maxStop int64) {
@@ -76,6 +83,14 @@ func (pw *PageWriter) UnlockForRead(startOffset, stopOffset int64) {
 
 func (pw *PageWriter) Destroy() {
 	pw.randomWriter.Destroy()
+}
+
+func (pw *PageWriter) EvictOneWritableChunk() bool {
+	return pw.randomWriter.EvictOneWritableChunk()
+}
+
+func (pw *PageWriter) ProactiveFlush(nowNs, idleThresholdNs, maxHoldNs, fillRatio int64, frontierLag int, isSequential bool) bool {
+	return pw.randomWriter.ProactiveFlush(nowNs, idleThresholdNs, maxHoldNs, fillRatio, frontierLag, isSequential)
 }
 
 func max(x, y int64) int64 {

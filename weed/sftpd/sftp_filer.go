@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strings"
@@ -17,9 +18,11 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	filer_pb "github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
 	"github.com/seaweedfs/seaweedfs/weed/sftpd/user"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc"
 )
 
@@ -87,7 +90,7 @@ func (fs *SftpServer) AdjustedUrl(location *filer_pb.Location) string { return l
 func (fs *SftpServer) GetDataCenter() string                          { return fs.dataCenter }
 func (fs *SftpServer) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
 	addr := fs.filerAddr.ToGrpcAddress()
-	return pb.WithGrpcClient(streamingMode, util.RandomInt32(), func(conn *grpc.ClientConn) error {
+	return pb.WithGrpcClient(context.Background(), streamingMode, util.RandomInt32(), func(conn *grpc.ClientConn) error {
 		return fn(filer_pb.NewSeaweedFilerClient(conn))
 	}, addr, false, fs.grpcDialOption)
 }
@@ -100,18 +103,26 @@ func (fs *SftpServer) withTimeoutContext(fn func(ctx context.Context) error) err
 // ==================== Command Dispatcher ====================
 
 func (fs *SftpServer) dispatchCmd(r *sftp.Request) error {
-	glog.V(0).Infof("Dispatch: %s %s", r.Method, r.Filepath)
+	absPath, err := fs.toAbsolutePath(r.Filepath)
+	if err != nil {
+		return err
+	}
+	glog.V(1).Infof("Dispatch: %s %s (absolute: %s)", r.Method, r.Filepath, absPath)
 	switch r.Method {
 	case "Remove":
-		return fs.removeEntry(r)
+		return fs.removeEntry(absPath)
 	case "Rename":
-		return fs.renameEntry(r)
+		absTarget, err := fs.toAbsolutePath(r.Target)
+		if err != nil {
+			return err
+		}
+		return fs.renameEntry(absPath, absTarget)
 	case "Mkdir":
-		return fs.makeDir(r)
+		return fs.makeDir(absPath)
 	case "Rmdir":
-		return fs.removeDir(r)
+		return fs.removeDir(absPath)
 	case "Setstat":
-		return fs.setFileStat(r)
+		return fs.setFileStatWithRequest(absPath, r)
 	default:
 		return fmt.Errorf("unsupported: %s", r.Method)
 	}
@@ -120,10 +131,14 @@ func (fs *SftpServer) dispatchCmd(r *sftp.Request) error {
 // ==================== File Operations ====================
 
 func (fs *SftpServer) readFile(r *sftp.Request) (io.ReaderAt, error) {
-	if err := fs.checkFilePermission(r.Filepath, "read"); err != nil {
+	absPath, err := fs.toAbsolutePath(r.Filepath)
+	if err != nil {
 		return nil, err
 	}
-	entry, err := fs.getEntry(r.Filepath)
+	if err := fs.checkFilePermission(absPath, "read"); err != nil {
+		return nil, err
+	}
+	entry, err := fs.getEntry(absPath)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +146,11 @@ func (fs *SftpServer) readFile(r *sftp.Request) (io.ReaderAt, error) {
 }
 
 func (fs *SftpServer) newFileWriter(r *sftp.Request) (io.WriterAt, error) {
-	dir, _ := util.FullPath(r.Filepath).DirAndName()
+	absPath, err := fs.toAbsolutePath(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+	dir, _ := util.FullPath(absPath).DirAndName()
 	if err := fs.checkFilePermission(dir, "write"); err != nil {
 		glog.Errorf("Permission denied for %s", dir)
 		return nil, err
@@ -139,12 +158,13 @@ func (fs *SftpServer) newFileWriter(r *sftp.Request) (io.WriterAt, error) {
 	// Create a temporary file to buffer writes
 	tmpFile, err := os.CreateTemp("", "sftp-upload-*")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %v", err)
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
 
 	return &SeaweedSftpFileWriter{
 		fs:          *fs,
 		req:         r,
+		absPath:     absPath,
 		tmpFile:     tmpFile,
 		permissions: 0644,
 		uid:         fs.user.Uid,
@@ -153,16 +173,20 @@ func (fs *SftpServer) newFileWriter(r *sftp.Request) (io.WriterAt, error) {
 	}, nil
 }
 
-func (fs *SftpServer) removeEntry(r *sftp.Request) error {
-	return fs.deleteEntry(r.Filepath, false)
+func (fs *SftpServer) removeEntry(absPath string) error {
+	return fs.deleteEntry(absPath, false)
 }
 
-func (fs *SftpServer) renameEntry(r *sftp.Request) error {
-	if err := fs.checkFilePermission(r.Filepath, "rename"); err != nil {
+func (fs *SftpServer) renameEntry(absPath, absTarget string) error {
+	if err := fs.checkFilePermission(absPath, "rename"); err != nil {
 		return err
 	}
-	oldDir, oldName := util.FullPath(r.Filepath).DirAndName()
-	newDir, newName := util.FullPath(r.Target).DirAndName()
+	targetDir, _ := util.FullPath(absTarget).DirAndName()
+	if err := fs.checkFilePermission(targetDir, "write"); err != nil {
+		return err
+	}
+	oldDir, oldName := util.FullPath(absPath).DirAndName()
+	newDir, newName := util.FullPath(absTarget).DirAndName()
 	return fs.callWithClient(false, func(ctx context.Context, client filer_pb.SeaweedFilerClient) error {
 		_, err := client.AtomicRenameEntry(ctx, &filer_pb.AtomicRenameEntryRequest{
 			OldDirectory: oldDir, OldName: oldName,
@@ -172,15 +196,15 @@ func (fs *SftpServer) renameEntry(r *sftp.Request) error {
 	})
 }
 
-func (fs *SftpServer) setFileStat(r *sftp.Request) error {
-	if err := fs.checkFilePermission(r.Filepath, "write"); err != nil {
+func (fs *SftpServer) setFileStatWithRequest(absPath string, r *sftp.Request) error {
+	if err := fs.checkFilePermission(absPath, "write"); err != nil {
 		return err
 	}
-	entry, err := fs.getEntry(r.Filepath)
+	entry, err := fs.getEntry(absPath)
 	if err != nil {
 		return err
 	}
-	dir, _ := util.FullPath(r.Filepath).DirAndName()
+	dir, _ := util.FullPath(absPath).DirAndName()
 	// apply attrs
 	if r.AttrFlags().Permissions {
 		entry.Attributes.FileMode = uint32(r.Attributes().FileMode())
@@ -201,18 +225,22 @@ func (fs *SftpServer) setFileStat(r *sftp.Request) error {
 // ==================== Directory Operations ====================
 
 func (fs *SftpServer) listDir(r *sftp.Request) (sftp.ListerAt, error) {
-	if err := fs.checkFilePermission(r.Filepath, "list"); err != nil {
+	absPath, err := fs.toAbsolutePath(r.Filepath)
+	if err != nil {
+		return nil, err
+	}
+	if err := fs.checkFilePermission(absPath, "list"); err != nil {
 		return nil, err
 	}
 	if r.Method == "Stat" || r.Method == "Lstat" {
-		entry, err := fs.getEntry(r.Filepath)
+		entry, err := fs.getEntry(absPath)
 		if err != nil {
 			return nil, err
 		}
 		fi := &EnhancedFileInfo{FileInfo: FileInfoFromEntry(entry), uid: entry.Attributes.Uid, gid: entry.Attributes.Gid}
 		return listerat([]os.FileInfo{fi}), nil
 	}
-	return fs.listAllPages(r.Filepath)
+	return fs.listAllPages(absPath)
 }
 
 func (fs *SftpServer) listAllPages(dirPath string) (sftp.ListerAt, error) {
@@ -259,18 +287,19 @@ func (fs *SftpServer) fetchDirectoryPage(dirPath, start string) ([]os.FileInfo, 
 }
 
 // makeDir creates a new directory with proper permissions.
-func (fs *SftpServer) makeDir(r *sftp.Request) error {
+func (fs *SftpServer) makeDir(absPath string) error {
 	if fs.user == nil {
 		return fmt.Errorf("cannot create directory: no user info")
 	}
-	dir, name := util.FullPath(r.Filepath).DirAndName()
-	if err := fs.checkFilePermission(r.Filepath, "mkdir"); err != nil {
+	dir, name := util.FullPath(absPath).DirAndName()
+	if err := fs.checkFilePermission(dir, "write"); err != nil {
 		return err
 	}
 	// default mode and ownership
 	err := filer_pb.Mkdir(context.Background(), fs, string(dir), name, func(entry *filer_pb.Entry) {
 		mode := uint32(0755 | os.ModeDir)
-		if strings.HasPrefix(r.Filepath, fs.user.HomeDir) {
+		// Defensive check: all paths should be under HomeDir after toAbsolutePath translation
+		if absPath == fs.user.HomeDir || strings.HasPrefix(absPath, fs.user.HomeDir+"/") {
 			mode = uint32(0700 | os.ModeDir)
 		}
 		entry.Attributes.FileMode = mode
@@ -288,13 +317,20 @@ func (fs *SftpServer) makeDir(r *sftp.Request) error {
 }
 
 // removeDir deletes a directory.
-func (fs *SftpServer) removeDir(r *sftp.Request) error {
-	return fs.deleteEntry(r.Filepath, false)
+func (fs *SftpServer) removeDir(absPath string) error {
+	return fs.deleteEntry(absPath, false)
 }
 
 func (fs *SftpServer) putFile(filepath string, reader io.Reader, user *user.User) error {
 	dir, filename := util.FullPath(filepath).DirAndName()
-	uploadUrl := fmt.Sprintf("http://%s%s", fs.filerAddr, filepath)
+	// Escape the path so a "?" in the filename cannot inject filer query commands like cp.from/mv.from.
+	uploadUrl := (&url.URL{Scheme: "http", Host: fs.filerAddr.ToHttpAddress(), Path: filepath}).String()
+	// Let the global HTTP client normalize the scheme to https:// when TLS is configured
+	normalizedUrl, err := util_http.NormalizeUrl(uploadUrl)
+	if err != nil {
+		return fmt.Errorf("normalize upload url %q: %w", uploadUrl, err)
+	}
+	uploadUrl = normalizedUrl
 
 	// Compute MD5 while uploading
 	hash := md5.New()
@@ -303,19 +339,27 @@ func (fs *SftpServer) putFile(filepath string, reader io.Reader, user *user.User
 	// We can skip ContentLength if unknown (chunked transfer encoding)
 	req, err := http.NewRequest(http.MethodPut, uploadUrl, body)
 	if err != nil {
-		return fmt.Errorf("create request: %v", err)
+		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 
-	resp, err := http.DefaultClient.Do(req)
+	// Add JWT authorization if filer signing key is configured
+	if len(fs.filerSigningKey) > 0 {
+		jwt := security.GenJwtForFilerServer(security.SigningKey(fs.filerSigningKey), fs.filerSigningExpiresAfter)
+		if jwt != "" {
+			req.Header.Set("Authorization", security.BearerPrefix+string(jwt))
+		}
+	}
+
+	resp, err := util_http.Do(req)
 	if err != nil {
-		return fmt.Errorf("upload to filer: %v", err)
+		return fmt.Errorf("upload to filer: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read response: %v", err)
+		return fmt.Errorf("read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
@@ -324,7 +368,7 @@ func (fs *SftpServer) putFile(filepath string, reader io.Reader, user *user.User
 
 	var result weed_server.FilerPostResult
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return fmt.Errorf("parse response: %v", err)
+		return fmt.Errorf("parse response: %w", err)
 	}
 	if result.Error != "" {
 		return fmt.Errorf("filer error: %s", result.Error)
@@ -338,7 +382,7 @@ func (fs *SftpServer) putFile(filepath string, reader io.Reader, user *user.User
 				Name:      filename,
 			})
 			if err != nil {
-				return fmt.Errorf("lookup file for attribute update: %v", err)
+				return fmt.Errorf("lookup file for attribute update: %w", err)
 			}
 
 			if lookupResp.Entry == nil {

@@ -15,6 +15,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/sftpd"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/grace"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
 var (
@@ -23,22 +25,23 @@ var (
 
 // SftpOptions holds configuration options for the SFTP server.
 type SftpOptions struct {
-	filer               *string
-	bindIp              *string
-	port                *int
-	sshPrivateKey       *string
-	hostKeysFolder      *string
-	authMethods         *string
-	maxAuthTries        *int
-	bannerMessage       *string
-	loginGraceTime      *time.Duration
-	clientAliveInterval *time.Duration
-	clientAliveCountMax *int
-	userStoreFile       *string
-	dataCenter          *string
-	metricsHttpPort     *int
-	metricsHttpIp       *string
-	localSocket         *string
+	filer                 *string
+	bindIp                *string
+	port                  *int
+	sshPrivateKey         *string
+	hostKeysFolder        *string
+	authMethods           *string
+	maxAuthTries          *int
+	bannerMessage         *string
+	loginGraceTime        *time.Duration
+	clientAliveInterval   *time.Duration
+	clientAliveCountMax   *int
+	userStoreFile         *string
+	trustedUserCAKeysFile *string
+	dataCenter            *string
+	metricsHttpPort       *int
+	metricsHttpIp         *string
+	localSocket           *string
 }
 
 // cmdSftp defines the SFTP command similar to the S3 command.
@@ -58,17 +61,18 @@ func init() {
 	cmdSftp.Run = runSftp
 
 	sftpOptionsStandalone.filer = cmdSftp.Flag.String("filer", "localhost:8888", "filer server address (ip:port)")
-	sftpOptionsStandalone.bindIp = cmdSftp.Flag.String("ip.bind", "0.0.0.0", "ip address to bind SFTP server")
+	sftpOptionsStandalone.bindIp = cmdSftp.Flag.String("ip.bind", "", "ip address to bind to. If empty, default to 0.0.0.0.")
 	sftpOptionsStandalone.port = cmdSftp.Flag.Int("port", 2022, "SFTP server listen port")
 	sftpOptionsStandalone.sshPrivateKey = cmdSftp.Flag.String("sshPrivateKey", "", "path to the SSH private key file for host authentication")
 	sftpOptionsStandalone.hostKeysFolder = cmdSftp.Flag.String("hostKeysFolder", "", "path to folder containing SSH private key files for host authentication")
-	sftpOptionsStandalone.authMethods = cmdSftp.Flag.String("authMethods", "password,publickey", "comma-separated list of allowed auth methods: password, publickey, keyboard-interactive")
+	sftpOptionsStandalone.authMethods = cmdSftp.Flag.String("authMethods", "password,publickey", "comma-separated list of allowed auth methods: password, publickey, certificate")
 	sftpOptionsStandalone.maxAuthTries = cmdSftp.Flag.Int("maxAuthTries", 6, "maximum number of authentication attempts per connection")
 	sftpOptionsStandalone.bannerMessage = cmdSftp.Flag.String("bannerMessage", "SeaweedFS SFTP Server - Unauthorized access is prohibited", "message displayed before authentication")
 	sftpOptionsStandalone.loginGraceTime = cmdSftp.Flag.Duration("loginGraceTime", 2*time.Minute, "timeout for authentication")
 	sftpOptionsStandalone.clientAliveInterval = cmdSftp.Flag.Duration("clientAliveInterval", 5*time.Second, "interval for sending keep-alive messages")
 	sftpOptionsStandalone.clientAliveCountMax = cmdSftp.Flag.Int("clientAliveCountMax", 3, "maximum number of missed keep-alive messages before disconnecting")
 	sftpOptionsStandalone.userStoreFile = cmdSftp.Flag.String("userStoreFile", "", "path to JSON file containing user credentials and permissions")
+	sftpOptionsStandalone.trustedUserCAKeysFile = cmdSftp.Flag.String("trustedUserCAKeysFile", "", "path to a file with trusted user CA public keys (OpenSSH authorized_keys format); required when 'certificate' is in -authMethods. Analogous to OpenSSH TrustedUserCAKeys and MinIO --sftp=trusted-user-ca-key")
 	sftpOptionsStandalone.dataCenter = cmdSftp.Flag.String("dataCenter", "", "prefer to read and write to volumes in this data center")
 	sftpOptionsStandalone.metricsHttpPort = cmdSftp.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
 	sftpOptionsStandalone.metricsHttpIp = cmdSftp.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
@@ -77,6 +81,7 @@ func init() {
 
 // runSftp is the command entry point.
 func runSftp(cmd *Command, args []string) bool {
+	sftpOptionsStandalone.resolvePaths()
 	// Load security configuration as done in other SeaweedFS services.
 	util.LoadSecurityConfiguration()
 
@@ -92,9 +97,28 @@ func runSftp(cmd *Command, args []string) bool {
 	return sftpOptionsStandalone.startSftpServer()
 }
 
+// resolvePaths expands "~" in every user-supplied path flag.
+// Idempotent — safe to call from any entry point.
+func (sftpOpt *SftpOptions) resolvePaths() {
+	*sftpOpt.sshPrivateKey = util.ResolvePath(*sftpOpt.sshPrivateKey)
+	*sftpOpt.hostKeysFolder = util.ResolvePath(*sftpOpt.hostKeysFolder)
+	*sftpOpt.userStoreFile = util.ResolvePath(*sftpOpt.userStoreFile)
+	*sftpOpt.trustedUserCAKeysFile = util.ResolvePath(*sftpOpt.trustedUserCAKeysFile)
+}
+
 func (sftpOpt *SftpOptions) startSftpServer() bool {
+	if *sftpOpt.bindIp == "" {
+		*sftpOpt.bindIp = "0.0.0.0"
+	}
+	util.SetOutboundLocalIP(*sftpOpt.bindIp)
 	filerAddress := pb.ServerAddress(*sftpOpt.filer)
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
+
+	// Load JWT configuration for filer signing
+	v := util.GetViper()
+	filerSigningKey := v.GetString("jwt.filer_signing.key")
+	v.SetDefault("jwt.filer_signing.expires_after_seconds", 600)
+	filerSigningExpiresAfter := v.GetInt("jwt.filer_signing.expires_after_seconds")
 
 	// metrics read from the filer
 	var metricsAddress string
@@ -132,20 +156,26 @@ func (sftpOpt *SftpOptions) startSftpServer() bool {
 
 	// Create a new SFTP service instance with all options
 	service := sftpd.NewSFTPService(&sftpd.SFTPServiceOptions{
-		GrpcDialOption:      grpcDialOption,
-		DataCenter:          *sftpOpt.dataCenter,
-		FilerGroup:          filerGroup,
-		Filer:               filerAddress,
-		SshPrivateKey:       *sftpOpt.sshPrivateKey,
-		HostKeysFolder:      *sftpOpt.hostKeysFolder,
-		AuthMethods:         authMethods,
-		MaxAuthTries:        *sftpOpt.maxAuthTries,
-		BannerMessage:       *sftpOpt.bannerMessage,
-		LoginGraceTime:      *sftpOpt.loginGraceTime,
-		ClientAliveInterval: *sftpOpt.clientAliveInterval,
-		ClientAliveCountMax: *sftpOpt.clientAliveCountMax,
-		UserStoreFile:       *sftpOpt.userStoreFile,
+		GrpcDialOption:           grpcDialOption,
+		DataCenter:               *sftpOpt.dataCenter,
+		FilerGroup:               filerGroup,
+		Filer:                    filerAddress,
+		SshPrivateKey:            *sftpOpt.sshPrivateKey,
+		HostKeysFolder:           *sftpOpt.hostKeysFolder,
+		AuthMethods:              authMethods,
+		MaxAuthTries:             *sftpOpt.maxAuthTries,
+		BannerMessage:            *sftpOpt.bannerMessage,
+		LoginGraceTime:           *sftpOpt.loginGraceTime,
+		ClientAliveInterval:      *sftpOpt.clientAliveInterval,
+		ClientAliveCountMax:      *sftpOpt.clientAliveCountMax,
+		UserStoreFile:            *sftpOpt.userStoreFile,
+		TrustedUserCAKeysFile:    *sftpOpt.trustedUserCAKeysFile,
+		FilerSigningKey:          []byte(filerSigningKey),
+		FilerSigningExpiresAfter: filerSigningExpiresAfter,
 	})
+
+	// Register reload hook for HUP signal
+	grace.OnReload(service.Reload)
 
 	// Set up Unix socket if on non-Windows platforms
 	if runtime.GOOS != "windows" {
@@ -175,7 +205,7 @@ func (sftpOpt *SftpOptions) startSftpServer() bool {
 		glog.Fatalf("SFTP server listener on %s error: %v", listenAddress, err)
 	}
 
-	glog.V(0).Infof("Start Seaweed SFTP Server %s at %s", util.Version(), listenAddress)
+	glog.V(0).Infof("Start Seaweed SFTP Server %s at %s", version.Version(), listenAddress)
 
 	if sftpLocalListener != nil {
 		go func() {

@@ -2,6 +2,7 @@ package filer
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"strings"
@@ -24,16 +25,19 @@ type VirtualFilerStore interface {
 	FilerStore
 	DeleteHardLink(ctx context.Context, hardLinkId HardLinkId) error
 	DeleteOneEntry(ctx context.Context, entry *Entry) error
+	InsertEntryKnownAbsent(ctx context.Context, entry *Entry) error
 	AddPathSpecificStore(path string, storeId string, store FilerStore)
 	OnBucketCreation(bucket string)
 	OnBucketDeletion(bucket string)
 	CanDropWholeBucket() bool
+	SameActualStore(a, b util.FullPath) bool
 }
 
 type FilerStoreWrapper struct {
-	defaultStore   FilerStore
-	pathToStore    ptrie.Trie[string]
-	storeIdToStore map[string]FilerStore
+	defaultStore         FilerStore
+	pathToStore          ptrie.Trie[string]
+	storeIdToStore       map[string]FilerStore
+	hasPathSpecificStore bool // fast check to skip MatchPrefix when no path-specific stores
 }
 
 func NewFilerStoreWrapper(store FilerStore) *FilerStoreWrapper {
@@ -81,10 +85,15 @@ func (fsw *FilerStoreWrapper) AddPathSpecificStore(path string, storeId string, 
 	if err != nil {
 		glog.Fatalf("put path specific store: %v", err)
 	}
+	fsw.hasPathSpecificStore = true
 }
 
 func (fsw *FilerStoreWrapper) getActualStore(path util.FullPath) (store FilerStore) {
 	store = fsw.defaultStore
+	// Fast path: skip MatchPrefix if no path-specific stores are configured (common case)
+	if !fsw.hasPathSpecificStore {
+		return
+	}
 	if path == "/" || path == "//" {
 		return
 	}
@@ -97,6 +106,13 @@ func (fsw *FilerStoreWrapper) getActualStore(path util.FullPath) (store FilerSto
 		store = fsw.storeIdToStore[storeId]
 	}
 	return
+}
+
+// SameActualStore reports whether two paths resolve to the same underlying
+// store. When path-specific stores are configured, different subtrees may
+// be served by different backends.
+func (fsw *FilerStoreWrapper) SameActualStore(a, b util.FullPath) bool {
+	return fsw.getActualStore(a) == fsw.getActualStore(b)
 }
 
 func (fsw *FilerStoreWrapper) getDefaultStore() (store FilerStore) {
@@ -112,12 +128,19 @@ func (fsw *FilerStoreWrapper) Initialize(configuration util.Configuration, prefi
 }
 
 func (fsw *FilerStoreWrapper) InsertEntry(ctx context.Context, entry *Entry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithoutCancel(ctx)
 	actualStore := fsw.getActualStore(entry.FullPath)
 	stats.FilerStoreCounter.WithLabelValues(actualStore.GetName(), "insert").Inc()
 
 	filer_pb.BeforeEntrySerialization(entry.GetChunks())
-	if entry.Mime == "application/octet-stream" {
-		entry.Mime = ""
+	normalizeEntryMimeForStore(entry)
+
+	if len(entry.HardLinkId) > 0 {
+		glog.V(4).InfofCtx(ctx, "InsertEntry %s has HardLinkId %x counter=%d",
+			entry.FullPath, entry.HardLinkId, entry.HardLinkCounter)
 	}
 
 	if err := fsw.handleUpdateToHardLinks(ctx, entry); err != nil {
@@ -136,13 +159,52 @@ func (fsw *FilerStoreWrapper) InsertEntry(ctx context.Context, entry *Entry) err
 	return actualStore.InsertEntry(ctx, entry)
 }
 
+// InsertEntryKnownAbsent skips the pre-insert FindEntry path when the caller has
+// already established that the target path does not exist.
+func (fsw *FilerStoreWrapper) InsertEntryKnownAbsent(ctx context.Context, entry *Entry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithoutCancel(ctx)
+	actualStore := fsw.getActualStore(entry.FullPath)
+	stats.FilerStoreCounter.WithLabelValues(actualStore.GetName(), "insert").Inc()
+	start := time.Now()
+	defer func() {
+		seconds := time.Since(start).Seconds()
+		if seconds > 2.0 {
+			glog.V(0).Infof("file store slow log (insertKnownAbsent):, %f %s", seconds, entry.FullPath)
+		}
+		stats.FilerStoreHistogram.WithLabelValues(actualStore.GetName(), "insert").Observe(seconds)
+	}()
+
+	filer_pb.BeforeEntrySerialization(entry.GetChunks())
+	normalizeEntryMimeForStore(entry)
+
+	if len(entry.HardLinkId) > 0 {
+		glog.V(4).InfofCtx(ctx, "InsertEntryKnownAbsent %s has HardLinkId %x counter=%d",
+			entry.FullPath, entry.HardLinkId, entry.HardLinkCounter)
+		if err := fsw.setHardLink(ctx, entry); err != nil {
+			return fmt.Errorf("setHardLink %x: %v", entry.HardLinkId, err)
+		}
+	}
+
+	return actualStore.InsertEntry(ctx, entry)
+}
+
 func (fsw *FilerStoreWrapper) UpdateEntry(ctx context.Context, entry *Entry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithoutCancel(ctx)
 	actualStore := fsw.getActualStore(entry.FullPath)
 	stats.FilerStoreCounter.WithLabelValues(actualStore.GetName(), "update").Inc()
 
 	filer_pb.BeforeEntrySerialization(entry.GetChunks())
-	if entry.Mime == "application/octet-stream" {
-		entry.Mime = ""
+	normalizeEntryMimeForStore(entry)
+
+	if len(entry.HardLinkId) > 0 {
+		glog.V(4).InfofCtx(ctx, "UpdateEntry %s has HardLinkId %x counter=%d",
+			entry.FullPath, entry.HardLinkId, entry.HardLinkCounter)
 	}
 
 	if err := fsw.handleUpdateToHardLinks(ctx, entry); err != nil {
@@ -161,7 +223,17 @@ func (fsw *FilerStoreWrapper) UpdateEntry(ctx context.Context, entry *Entry) err
 	return actualStore.UpdateEntry(ctx, entry)
 }
 
+func normalizeEntryMimeForStore(entry *Entry) {
+	if entry == nil {
+		return
+	}
+	if !entry.IsDirectory() && entry.Mime == "application/octet-stream" {
+		entry.Mime = ""
+	}
+}
+
 func (fsw *FilerStoreWrapper) FindEntry(ctx context.Context, fp util.FullPath) (entry *Entry, err error) {
+	ctx = context.WithoutCancel(ctx)
 	actualStore := fsw.getActualStore(fp)
 	stats.FilerStoreCounter.WithLabelValues(actualStore.GetName(), "find").Inc()
 	start := time.Now()
@@ -193,6 +265,10 @@ func (fsw *FilerStoreWrapper) FindEntry(ctx context.Context, fp util.FullPath) (
 }
 
 func (fsw *FilerStoreWrapper) DeleteEntry(ctx context.Context, fp util.FullPath) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithoutCancel(ctx)
 	actualStore := fsw.getActualStore(fp)
 	stats.FilerStoreCounter.WithLabelValues(actualStore.GetName(), "delete").Inc()
 
@@ -204,9 +280,12 @@ func (fsw *FilerStoreWrapper) DeleteEntry(ctx context.Context, fp util.FullPath)
 		// remove hard link
 		op := ctx.Value("OP")
 		if op != "MV" {
-			glog.V(4).Infof("DeleteHardLink %s", existingEntry.FullPath)
-			if err = fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); err != nil {
-				return err
+			glog.V(4).InfofCtx(ctx, "DeleteHardLink %s", existingEntry.FullPath)
+			if hlErr := fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); hlErr != nil {
+				// Log but continue: the directory entry must be removed
+				// even if hard link counter cleanup fails, otherwise the
+				// parent directory cannot be removed (rmdir ENOTEMPTY).
+				glog.Warningf("DeleteHardLink %s (id %x): %v", existingEntry.FullPath, existingEntry.HardLinkId, hlErr)
 			}
 		}
 	}
@@ -224,6 +303,10 @@ func (fsw *FilerStoreWrapper) DeleteEntry(ctx context.Context, fp util.FullPath)
 }
 
 func (fsw *FilerStoreWrapper) DeleteOneEntry(ctx context.Context, existingEntry *Entry) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithoutCancel(ctx)
 	actualStore := fsw.getActualStore(existingEntry.FullPath)
 	stats.FilerStoreCounter.WithLabelValues(actualStore.GetName(), "delete").Inc()
 
@@ -231,9 +314,13 @@ func (fsw *FilerStoreWrapper) DeleteOneEntry(ctx context.Context, existingEntry 
 		// remove hard link
 		op := ctx.Value("OP")
 		if op != "MV" {
-			glog.V(4).Infof("DeleteHardLink %s", existingEntry.FullPath)
-			if err = fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); err != nil {
-				return err
+			glog.V(4).InfofCtx(ctx, "DeleteHardLink %s", existingEntry.FullPath)
+			if hlErr := fsw.DeleteHardLink(ctx, existingEntry.HardLinkId); hlErr != nil {
+				// Log the hard link cleanup error but continue to delete
+				// the directory entry. If we return early here, the entry
+				// remains in the store and the parent directory cannot be
+				// removed (rmdir returns ENOTEMPTY).
+				glog.Warningf("DeleteHardLink %s (id %x): %v", existingEntry.FullPath, existingEntry.HardLinkId, hlErr)
 			}
 		}
 	}
@@ -251,6 +338,10 @@ func (fsw *FilerStoreWrapper) DeleteOneEntry(ctx context.Context, existingEntry 
 }
 
 func (fsw *FilerStoreWrapper) DeleteFolderChildren(ctx context.Context, fp util.FullPath) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithoutCancel(ctx)
 	actualStore := fsw.getActualStore(fp + "/")
 	stats.FilerStoreCounter.WithLabelValues(actualStore.GetName(), "deleteFolderChildren").Inc()
 	start := time.Now()
@@ -262,11 +353,11 @@ func (fsw *FilerStoreWrapper) DeleteFolderChildren(ctx context.Context, fp util.
 		stats.FilerStoreHistogram.WithLabelValues(actualStore.GetName(), "deleteFolderChildren").Observe(seconds)
 	}()
 
-	// glog.V(4).Infof("DeleteFolderChildren %s", fp)
 	return actualStore.DeleteFolderChildren(ctx, fp)
 }
 
 func (fsw *FilerStoreWrapper) ListDirectoryEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc ListEachEntryFunc) (string, error) {
+	ctx = context.WithoutCancel(ctx)
 	actualStore := fsw.getActualStore(dirPath + "/")
 	stats.FilerStoreCounter.WithLabelValues(actualStore.GetName(), "list").Inc()
 	start := time.Now()
@@ -279,7 +370,7 @@ func (fsw *FilerStoreWrapper) ListDirectoryEntries(ctx context.Context, dirPath 
 	}()
 
 	// glog.V(4).Infof("ListDirectoryEntries %s from %s limit %d", dirPath, startFileName, limit)
-	return actualStore.ListDirectoryEntries(ctx, dirPath, startFileName, includeStartFile, limit, func(entry *Entry) bool {
+	return actualStore.ListDirectoryEntries(ctx, dirPath, startFileName, includeStartFile, limit, func(entry *Entry) (bool, error) {
 		fsw.maybeReadHardLink(ctx, entry)
 		filer_pb.AfterEntryDeserialization(entry.GetChunks())
 		return eachEntryFunc(entry)
@@ -287,13 +378,14 @@ func (fsw *FilerStoreWrapper) ListDirectoryEntries(ctx context.Context, dirPath 
 }
 
 func (fsw *FilerStoreWrapper) ListDirectoryPrefixedEntries(ctx context.Context, dirPath util.FullPath, startFileName string, includeStartFile bool, limit int64, prefix string, eachEntryFunc ListEachEntryFunc) (lastFileName string, err error) {
+	ctx = context.WithoutCancel(ctx)
 	actualStore := fsw.getActualStore(dirPath + "/")
 	stats.FilerStoreCounter.WithLabelValues(actualStore.GetName(), "prefixList").Inc()
 	if limit > math.MaxInt32-1 {
 		limit = math.MaxInt32 - 1
 	}
 	// glog.V(4).Infof("ListDirectoryPrefixedEntries %s from %s prefix %s limit %d", dirPath, startFileName, prefix, limit)
-	adjustedEntryFunc := func(entry *Entry) bool {
+	adjustedEntryFunc := func(entry *Entry) (bool, error) {
 		fsw.maybeReadHardLink(ctx, entry)
 		filer_pb.AfterEntryDeserialization(entry.GetChunks())
 		return eachEntryFunc(entry)
@@ -322,9 +414,9 @@ func (fsw *FilerStoreWrapper) prefixFilterEntries(ctx context.Context, dirPath u
 	}
 
 	var notPrefixed []*Entry
-	lastFileName, err = actualStore.ListDirectoryEntries(ctx, dirPath, startFileName, includeStartFile, limit, func(entry *Entry) bool {
+	lastFileName, err = actualStore.ListDirectoryEntries(ctx, dirPath, startFileName, includeStartFile, limit, func(entry *Entry) (bool, error) {
 		notPrefixed = append(notPrefixed, entry)
-		return true
+		return true, nil
 	})
 	if err != nil {
 		return
@@ -335,7 +427,14 @@ func (fsw *FilerStoreWrapper) prefixFilterEntries(ctx context.Context, dirPath u
 		for _, entry := range notPrefixed {
 			if strings.HasPrefix(entry.Name(), prefix) {
 				count++
-				if !eachEntryFunc(entry) {
+				res, resErr := eachEntryFunc(entry)
+
+				if resErr != nil {
+					err = fmt.Errorf("failed to process eachEntryFunc for entry %q: %w", entry.Name(), resErr)
+					return
+				}
+
+				if !res {
 					return
 				}
 				if count >= limit {
@@ -345,9 +444,9 @@ func (fsw *FilerStoreWrapper) prefixFilterEntries(ctx context.Context, dirPath u
 		}
 		if count < limit && lastFileName < prefix {
 			notPrefixed = notPrefixed[:0]
-			lastFileName, err = actualStore.ListDirectoryEntries(ctx, dirPath, lastFileName, false, limit, func(entry *Entry) bool {
+			lastFileName, err = actualStore.ListDirectoryEntries(ctx, dirPath, lastFileName, false, limit, func(entry *Entry) (bool, error) {
 				notPrefixed = append(notPrefixed, entry)
-				return true
+				return true, nil
 			})
 			if err != nil {
 				return
@@ -360,14 +459,23 @@ func (fsw *FilerStoreWrapper) prefixFilterEntries(ctx context.Context, dirPath u
 }
 
 func (fsw *FilerStoreWrapper) BeginTransaction(ctx context.Context) (context.Context, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ctx = context.WithoutCancel(ctx)
 	return fsw.getDefaultStore().BeginTransaction(ctx)
 }
 
 func (fsw *FilerStoreWrapper) CommitTransaction(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithoutCancel(ctx)
 	return fsw.getDefaultStore().CommitTransaction(ctx)
 }
 
 func (fsw *FilerStoreWrapper) RollbackTransaction(ctx context.Context) error {
+	ctx = context.WithoutCancel(ctx)
 	return fsw.getDefaultStore().RollbackTransaction(ctx)
 }
 
@@ -376,12 +484,21 @@ func (fsw *FilerStoreWrapper) Shutdown() {
 }
 
 func (fsw *FilerStoreWrapper) KvPut(ctx context.Context, key []byte, value []byte) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithoutCancel(ctx)
 	return fsw.getDefaultStore().KvPut(ctx, key, value)
 }
 func (fsw *FilerStoreWrapper) KvGet(ctx context.Context, key []byte) (value []byte, err error) {
+	ctx = context.WithoutCancel(ctx)
 	return fsw.getDefaultStore().KvGet(ctx, key)
 }
 func (fsw *FilerStoreWrapper) KvDelete(ctx context.Context, key []byte) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithoutCancel(ctx)
 	return fsw.getDefaultStore().KvDelete(ctx, key)
 }
 

@@ -2,17 +2,21 @@ package weed_server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/cluster/maintenance"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/telemetry"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -30,12 +34,14 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/topology"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
 const (
 	SequencerType        = "master.sequencer.type"
 	SequencerSnowflakeId = "master.sequencer.sequencer_snowflake_id"
+	raftApplyTimeout     = 1 * time.Second
 )
 
 type MasterOption struct {
@@ -52,6 +58,9 @@ type MasterOption struct {
 	MetricsAddress          string
 	MetricsIntervalSec      int
 	IsFollower              bool
+	TelemetryUrl            string
+	TelemetryEnabled        bool
+	VolumeGrowthDisabled    bool
 }
 
 type MasterServer struct {
@@ -71,11 +80,18 @@ type MasterServer struct {
 
 	grpcDialOption grpc.DialOption
 
+	topologyIdGenLock sync.Mutex
+
 	MasterClient *wdclient.MasterClient
 
 	adminLocks *AdminLocks
 
 	Cluster *cluster.Cluster
+
+	LockRingManager *cluster.LockRingManager
+
+	// telemetry
+	telemetryCollector *telemetry.Collector
 }
 
 func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.ServerAddress) *MasterServer {
@@ -97,6 +113,9 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	v.SetDefault("master.volume_growth.copy_3", topology.VolumeGrowStrategy.Copy3Count)
 	v.SetDefault("master.volume_growth.copy_other", topology.VolumeGrowStrategy.CopyOtherCount)
 	v.SetDefault("master.volume_growth.threshold", topology.VolumeGrowStrategy.Threshold)
+	v.SetDefault("master.volume_growth.disable", false)
+	option.VolumeGrowthDisabled = v.GetBool("master.volume_growth.disable")
+
 	topology.VolumeGrowStrategy.Copy1Count = v.GetUint32("master.volume_growth.copy_1")
 	topology.VolumeGrowStrategy.Copy2Count = v.GetUint32("master.volume_growth.copy_2")
 	topology.VolumeGrowStrategy.Copy3Count = v.GetUint32("master.volume_growth.copy_3")
@@ -121,6 +140,8 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		Cluster:                 cluster.NewCluster(),
 	}
 
+	ms.LockRingManager = cluster.NewLockRingManager(ms.broadcastToClients)
+
 	ms.MasterClient.SetOnPeerUpdateFn(ms.OnPeerUpdate)
 
 	seq := ms.createSequencer(option)
@@ -131,9 +152,25 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	ms.vg = topology.NewDefaultVolumeGrowth()
 	glog.V(0).Infoln("Volume Size Limit is", ms.option.VolumeSizeLimitMB, "MB")
 
+	// Initialize telemetry after topology is created
+	if option.TelemetryEnabled && option.TelemetryUrl != "" {
+		telemetryClient := telemetry.NewClient(option.TelemetryUrl, option.TelemetryEnabled)
+		ms.telemetryCollector = telemetry.NewCollector(telemetryClient, ms.Topo, ms.Cluster)
+		ms.telemetryCollector.SetMasterServer(ms)
+
+		// Set version and OS information
+		ms.telemetryCollector.SetVersion(version.VERSION_NUMBER)
+		ms.telemetryCollector.SetOS(runtime.GOOS + "/" + runtime.GOARCH)
+
+		// Start periodic telemetry collection (every 24 hours)
+		ms.telemetryCollector.StartPeriodicCollection(24 * time.Hour)
+	}
+
 	ms.guard = security.NewGuard(append(ms.option.WhiteList, whiteList...), signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 
 	handleStaticResources2(r)
+	r.HandleFunc("/healthz", requestIDMiddleware(ms.healthzHandler)).Methods(http.MethodGet, http.MethodHead)
+	r.HandleFunc("/readyz", requestIDMiddleware(ms.readyzHandler)).Methods(http.MethodGet, http.MethodHead)
 	r.HandleFunc("/", ms.proxyToLeader(requestIDMiddleware(ms.uiStatusHandler)))
 	r.HandleFunc("/ui/index.html", requestIDMiddleware(ms.uiStatusHandler))
 	if !ms.option.DisableHttp {
@@ -154,6 +191,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		r.HandleFunc("/{fileId}", requestIDMiddleware(ms.redirectHandler))
 	}
 
+	ms.Topo.SetAdminServerConnectedFunc(ms.isAdminServerConnectedFunc)
 	ms.Topo.StartRefreshWritableVolumes(
 		ms.grpcDialOption,
 		ms.option.GarbageThreshold,
@@ -168,7 +206,33 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		ms.startAdminScripts()
 	}
 
+	stats.MasterStartTimeSeconds.Set(float64(time.Now().Unix()))
 	return ms
+}
+
+func (ms *MasterServer) healthzHandler(w http.ResponseWriter, r *http.Request) {
+	// Liveness: process is alive. Keep this fast and simple.
+	w.WriteHeader(http.StatusOK)
+}
+
+func (ms *MasterServer) readyzHandler(w http.ResponseWriter, r *http.Request) {
+	// Readiness: check we can serve traffic.
+	leader, err := ms.Topo.Leader()
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if ms.option.Master.Equals(leader) {
+		isLocked, err := ms.Topo.IsChildLocked()
+		if err != nil {
+			glog.Errorf("readyzHandler: %+v", err)
+		}
+		if isLocked {
+			w.WriteHeader(http.StatusLocked)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
@@ -182,19 +246,26 @@ func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
 			stats.MasterLeaderChangeCounter.WithLabelValues(fmt.Sprintf("%+v", e.Value())).Inc()
 			if ms.Topo.RaftServer.Leader() != "" {
 				glog.V(0).Infof("[%s] %s becomes leader.", ms.Topo.RaftServer.Name(), ms.Topo.RaftServer.Leader())
-				ms.Topo.LastLeaderChangeTime = time.Now()
+				ms.Topo.SetLastLeaderChangeTime(time.Now())
+				if pb.ServerAddress(ms.Topo.RaftServer.Leader()).Equals(pb.ServerAddress(ms.Topo.RaftServer.Name())) {
+					go ms.ensureTopologyId()
+				}
 			}
 		})
 		raftServerName = fmt.Sprintf("[%s]", ms.Topo.RaftServer.Name())
 	} else if raftServer.RaftHashicorp != nil {
 		ms.Topo.HashicorpRaft = raftServer.RaftHashicorp
 		raftServerName = ms.Topo.HashicorpRaft.String()
-		ms.Topo.LastLeaderChangeTime = time.Now()
 	}
 	ms.Topo.RaftServerAccessLock.Unlock()
 
 	if ms.Topo.IsLeader() {
+		// Seed the warmup timestamp so IsWarmingUp() is active even if the
+		// leader change event hasn't fired yet (e.g. node is already leader
+		// on startup). Followers don't need warmup state.
+		ms.Topo.SetLastLeaderChangeTime(time.Now())
 		glog.V(0).Infof("%s I am the leader!", raftServerName)
+		go ms.ensureTopologyId()
 	} else {
 		var raftServerLeader string
 		ms.Topo.RaftServerAccessLock.RLock()
@@ -207,6 +278,78 @@ func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
 		}
 		ms.Topo.RaftServerAccessLock.RUnlock()
 		glog.V(0).Infof("%s %s - is the leader.", raftServerName, raftServerLeader)
+	}
+}
+
+func (ms *MasterServer) syncRaftForTopologyId(topologyId string) error {
+	ms.Topo.RaftServerAccessLock.RLock()
+	defer ms.Topo.RaftServerAccessLock.RUnlock()
+
+	if ms.Topo.RaftServer != nil {
+		_, err := ms.Topo.RaftServer.Do(topology.NewMaxVolumeIdCommand(ms.Topo.GetMaxVolumeId(), topologyId))
+		return err
+	} else if ms.Topo.HashicorpRaft != nil {
+		b, err := json.Marshal(topology.NewMaxVolumeIdCommand(ms.Topo.GetMaxVolumeId(), topologyId))
+		if err != nil {
+			return fmt.Errorf("failed marshal NewMaxVolumeIdCommand: %v", err)
+		}
+		if future := ms.Topo.HashicorpRaft.Apply(b, raftApplyTimeout); future.Error() != nil {
+			return future.Error()
+		}
+		return nil
+	}
+	return fmt.Errorf("no raft server configured")
+}
+
+func (ms *MasterServer) ensureTopologyId() {
+	ms.topologyIdGenLock.Lock()
+	defer ms.topologyIdGenLock.Unlock()
+
+	// Send a no-op command to ensure all previous logs are applied (barrier)
+	// This handles the case where log replay is still in progress
+	glog.V(1).Infof("ensureTopologyId: sending barrier command")
+	for {
+		if !ms.Topo.IsLeader() {
+			glog.V(1).Infof("lost leadership while sending barrier command for topologyId")
+			return
+		}
+		if err := ms.syncRaftForTopologyId(ms.Topo.GetTopologyId()); err != nil {
+			glog.Errorf("failed to sync raft for topologyId: %v, retrying in 1s", err)
+			time.Sleep(time.Second)
+			continue
+		}
+		break
+	}
+	glog.V(1).Infof("ensureTopologyId: barrier command completed")
+
+	if !ms.Topo.IsLeader() {
+		return
+	}
+
+	currentId := ms.Topo.GetTopologyId()
+	glog.V(1).Infof("ensureTopologyId: current TopologyId after barrier: %s", currentId)
+
+	prevId := ms.Topo.GetTopologyId()
+
+	EnsureTopologyId(ms.Topo, func() bool {
+		return ms.Topo.IsLeader()
+	}, func(topologyId string) error {
+		return ms.syncRaftForTopologyId(topologyId)
+	})
+
+	// If a new TopologyId was generated, take a snapshot so it survives
+	// raft state cleanup on future non-resume restarts.
+	if prevId == "" && ms.Topo.GetTopologyId() != "" {
+		ms.Topo.RaftServerAccessLock.RLock()
+		if ms.Topo.RaftServer != nil {
+			if err := ms.Topo.RaftServer.TakeSnapshot(); err != nil {
+				glog.Warningf("snapshot after TopologyId generation: %v", err)
+			} else {
+				glog.V(0).Infof("snapshot taken to persist TopologyId %s", ms.Topo.GetTopologyId())
+			}
+		}
+		// Hashicorp raft snapshots are handled automatically.
+		ms.Topo.RaftServerAccessLock.RUnlock()
 	}
 }
 
@@ -225,27 +368,30 @@ func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		targetUrl, err := url.Parse("http://" + raftServerLeader)
+		// determine the scheme based on HTTPS client configuration
+		scheme := util_http.GetGlobalHttpClient().GetHttpScheme()
+
+		targetUrl, err := url.Parse(scheme + "://" + raftServerLeader)
 		if err != nil {
 			writeJsonError(w, r, http.StatusInternalServerError,
-				fmt.Errorf("Leader URL http://%s Parse Error: %v", raftServerLeader, err))
+				fmt.Errorf("Leader URL %s://%s Parse Error: %v", scheme, raftServerLeader, err))
 			return
 		}
 
 		// proxy to leader
-		glog.V(4).Infoln("proxying to leader", raftServerLeader)
+		glog.V(4).Infoln("proxying to leader", raftServerLeader, "using", scheme)
 		proxy := httputil.NewSingleHostReverseProxy(targetUrl)
-		director := proxy.Director
-		proxy.Director = func(req *http.Request) {
-			actualHost, err := security.GetActualRemoteHost(req)
-			if err == nil {
-				req.Header.Set("HTTP_X_FORWARDED_FOR", actualHost)
-			}
-			director(req)
-		}
 		proxy.Transport = util_http.GetGlobalHttpClient().GetClientTransport()
 		proxy.ServeHTTP(w, r)
 	}
+}
+
+func (ms *MasterServer) isAdminServerConnectedFunc() bool {
+	if ms == nil || ms.adminLocks == nil {
+		return false
+	}
+	_, _, isLocked := ms.adminLocks.isLocked(cluster.AdminServerPresenceLockName)
+	return isLocked
 }
 
 func (ms *MasterServer) startAdminScripts() {
@@ -256,8 +402,10 @@ func (ms *MasterServer) startAdminScripts() {
 	}
 	glog.V(0).Infof("adminScripts: %v", adminScripts)
 
-	v.SetDefault("master.maintenance.sleep_minutes", 17)
-	sleepMinutes := v.GetInt("master.maintenance.sleep_minutes")
+	sleepMinutes := v.GetFloat64("master.maintenance.sleep_minutes")
+	if sleepMinutes <= 0 {
+		sleepMinutes = float64(maintenance.DefaultMaintenanceSleepMinutes)
+	}
 
 	scriptLines := strings.Split(adminScripts, "\n")
 	if !strings.Contains(adminScripts, "lock") {
@@ -285,6 +433,10 @@ func (ms *MasterServer) startAdminScripts() {
 		for {
 			time.Sleep(time.Duration(sleepMinutes) * time.Minute)
 			if ms.Topo.IsLeader() && ms.MasterClient.GetMaster(context.Background()) != "" {
+				if ms.isAdminServerConnectedFunc() {
+					glog.V(1).Infof("Skipping master maintenance scripts because admin server is connected")
+					continue
+				}
 				shellOptions.FilerAddress = ms.GetOneFiler(cluster.FilerGroupName(*shellOptions.FilerGroup))
 				if shellOptions.FilerAddress == "" {
 					continue
@@ -356,7 +508,7 @@ func (ms *MasterServer) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, startF
 	glog.V(4).Infof("OnPeerUpdate: %+v", update)
 
 	peerAddress := pb.ServerAddress(update.Address)
-	peerName := string(peerAddress)
+	peerName := raftServerID(peerAddress)
 	if ms.Topo.HashicorpRaft.State() != hashicorpRaft.Leader {
 		return
 	}
@@ -374,18 +526,15 @@ func (ms *MasterServer) OnPeerUpdate(update *master_pb.ClusterNodeUpdate, startF
 				hashicorpRaft.ServerAddress(peerAddress.ToGrpcAddress()), 0, 0)
 		}
 	} else {
-		pb.WithMasterClient(false, peerAddress, ms.grpcDialOption, true, func(client master_pb.SeaweedClient) error {
+		pb.WithMasterClient(context.Background(), false, peerAddress, ms.grpcDialOption, true, func(client master_pb.SeaweedClient) error {
 			ctx, cancel := context.WithTimeout(context.TODO(), 15*time.Second)
 			defer cancel()
 			if _, err := client.Ping(ctx, &master_pb.PingRequest{Target: string(peerAddress), TargetType: cluster.MasterType}); err != nil {
 				glog.V(0).Infof("master %s didn't respond to pings. remove raft server", peerName)
-				if err := ms.MasterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
-					_, err := client.RaftRemoveServer(context.Background(), &master_pb.RaftRemoveServerRequest{
-						Id:    peerName,
-						Force: false,
-					})
-					return err
-				}); err != nil {
+				// We are the leader here, so drop the dead peer through the local
+				// raft handle, mirroring the AddVoter branch above, instead of
+				// dialing our own RaftRemoveServer RPC.
+				if err := ms.Topo.HashicorpRaft.RemoveServer(hashicorpRaft.ServerID(peerName), 0, 0).Error(); err != nil {
 					glog.Warningf("failed removing old raft server: %v", err)
 					return err
 				}
@@ -414,5 +563,11 @@ func (ms *MasterServer) Reload() {
 	v := util.GetViper()
 	ms.guard.UpdateWhiteList(append(ms.option.WhiteList,
 		util.StringSplit(v.GetString("guard.white_list"), ",")...),
+	)
+	ms.guard.UpdateSigningKeys(
+		v.GetString("jwt.signing.key"),
+		v.GetInt("jwt.signing.expires_after_seconds"),
+		v.GetString("jwt.signing.read.key"),
+		v.GetInt("jwt.signing.read.expires_after_seconds"),
 	)
 }

@@ -17,6 +17,31 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
+// maxEagerPreGrow caps how many bytes ParseUpload is willing to pre-allocate
+// from a request's announced Content-Length. Large enough to skip a few
+// rounds of bytes.Buffer.ReadFrom geometric grow on typical small uploads;
+// small enough that a misreported Content-Length or a slow/idle client can
+// only ever waste this much memory per request. Bigger uploads fall back to
+// the standard ReadFrom-grow path for the remainder.
+const maxEagerPreGrow = 4 * 1024 * 1024
+
+// eagerPreGrow ensures bytesBuffer has at least min(contentLength, sizeLimit,
+// maxEagerPreGrow) bytes of capacity, so the bytes.Buffer.ReadFrom pumps
+// inside parseUpload below skip the first round(s) of geometric grow on the
+// common upload sizes — see #6541. The cap policy is the load-bearing piece
+// here; it's extracted so unit tests can exercise the policy directly
+// without spinning a real http upload.
+func eagerPreGrow(bytesBuffer *bytes.Buffer, contentLength, sizeLimit int64) {
+	if contentLength <= 0 || contentLength > sizeLimit {
+		return
+	}
+	grow := contentLength
+	if grow > maxEagerPreGrow {
+		grow = maxEagerPreGrow
+	}
+	bytesBuffer.Grow(int(grow))
+}
+
 type ParsedUpload struct {
 	FileName    string
 	Data        []byte
@@ -35,6 +60,7 @@ type ParsedUpload struct {
 
 func ParseUpload(r *http.Request, sizeLimit int64, bytesBuffer *bytes.Buffer) (pu *ParsedUpload, e error) {
 	bytesBuffer.Reset()
+	eagerPreGrow(bytesBuffer, r.ContentLength, sizeLimit)
 	pu = &ParsedUpload{bytesBuffer: bytesBuffer}
 	pu.PairMap = make(map[string]string)
 	for k, v := range r.Header {
@@ -42,6 +68,7 @@ func ParseUpload(r *http.Request, sizeLimit int64, bytesBuffer *bytes.Buffer) (p
 			pu.PairMap[k] = v[0]
 		}
 	}
+	// glog.V(4).Infof("ParseUpload: r.URL=%s, Content-MD5 header=%s", r.URL.String(), r.Header.Get("Content-MD5"))
 
 	e = parseUpload(r, sizeLimit, pu)
 
@@ -56,12 +83,19 @@ func ParseUpload(r *http.Request, sizeLimit int64, bytesBuffer *bytes.Buffer) (p
 	pu.UncompressedData = pu.Data
 	// println("received data", len(pu.Data), "isGzipped", pu.IsGzipped, "mime", pu.MimeType, "name", pu.FileName)
 	if pu.IsGzipped {
-		if unzipped, e := util.DecompressData(pu.Data); e == nil {
-			pu.OriginalDataSize = len(unzipped)
-			pu.UncompressedData = unzipped
-			// println("ungzipped data size", len(unzipped))
+		// MD5 check needs the uncompressed bytes; otherwise just count
+		// the gunzip stream — see #6541.
+		needMD5 := r.Header.Get("Content-MD5") != "" || pu.ContentMd5 != ""
+		if needMD5 {
+			if unzipped, err := util.DecompressData(pu.Data); err == nil {
+				pu.OriginalDataSize = len(unzipped)
+				pu.UncompressedData = unzipped
+			}
+		} else if n, err := util.GunzipStream(io.Discard, bytes.NewReader(pu.Data)); err == nil {
+			pu.OriginalDataSize = int(n)
 		}
-	} else {
+	} else if r.URL.Query().Get("type") != "replicate" {
+		// replica writes must keep the source needle's compression state, not re-derive it
 		ext := filepath.Base(pu.FileName)
 		mimeType := pu.MimeType
 		if mimeType == "" {
@@ -83,11 +117,15 @@ func ParseUpload(r *http.Request, sizeLimit int64, bytesBuffer *bytes.Buffer) (p
 		}
 	}
 
-	// md5
-	h := md5.New()
-	h.Write(pu.UncompressedData)
-	pu.ContentMd5 = base64.StdEncoding.EncodeToString(h.Sum(nil))
-	if expectedChecksum := r.Header.Get("Content-MD5"); expectedChecksum != "" {
+	// verify Content-MD5
+	expectedChecksum := r.Header.Get("Content-MD5")
+	if expectedChecksum == "" {
+		expectedChecksum = pu.ContentMd5
+	}
+	if expectedChecksum != "" {
+		h := md5.New()
+		h.Write(pu.UncompressedData)
+		pu.ContentMd5 = base64.StdEncoding.EncodeToString(h.Sum(nil))
 		if expectedChecksum != pu.ContentMd5 {
 			e = fmt.Errorf("Content-MD5 did not match md5 of file data expected [%s] received [%s] size %d", expectedChecksum, pu.ContentMd5, len(pu.UncompressedData))
 			return
@@ -128,7 +166,7 @@ func parseUpload(r *http.Request, sizeLimit int64, pu *ParsedUpload) (e error) {
 
 		pu.FileName = part.FileName()
 		if pu.FileName != "" {
-			pu.FileName = path.Base(pu.FileName)
+			pu.FileName = util.CleanWindowsPathBase(pu.FileName)
 		}
 
 		dataSize, e = pu.bytesBuffer.ReadFrom(io.LimitReader(part, sizeLimit+1))
@@ -143,6 +181,7 @@ func parseUpload(r *http.Request, sizeLimit int64, pu *ParsedUpload) (e error) {
 		pu.Data = pu.bytesBuffer.Bytes()
 
 		contentType = part.Header.Get("Content-Type")
+		pu.ContentMd5 = part.Header.Get("Content-MD5")
 
 		// if the filename is empty string, do a search on the other multi-part items
 		for pu.FileName == "" {
@@ -169,8 +208,9 @@ func parseUpload(r *http.Request, sizeLimit int64, pu *ParsedUpload) (e error) {
 
 				// update
 				pu.Data = pu.bytesBuffer.Bytes()
-				pu.FileName = path.Base(fName)
-				contentType = part.Header.Get("Content-Type")
+				pu.FileName = util.CleanWindowsPathBase(fName)
+				contentType = part2.Header.Get("Content-Type")
+				pu.ContentMd5 = part2.Header.Get("Content-MD5")
 				part = part2
 				break
 			}
@@ -207,7 +247,7 @@ func parseUpload(r *http.Request, sizeLimit int64, pu *ParsedUpload) (e error) {
 		}
 
 		if pu.FileName != "" {
-			pu.FileName = path.Base(pu.FileName)
+			pu.FileName = util.CleanWindowsPathBase(pu.FileName)
 		} else {
 			pu.FileName = path.Base(r.URL.Path)
 		}

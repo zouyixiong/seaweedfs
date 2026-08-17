@@ -85,8 +85,9 @@ func main() {
 		}
 		return
 	}
-
-	util_http.InitGlobalHttpClient()
+	if args[0] != command.GetFuseCommandName() {
+		util_http.InitGlobalHttpClient()
+	}
 	for _, cmd := range commands {
 		if cmd.Name() == args[0] && cmd.Run != nil {
 			cmd.Flag.Usage = func() { cmd.Usage() }
@@ -195,17 +196,9 @@ func help(args []string) {
 
 var atexitFuncs []func()
 
-func atexit(f func()) {
-	atexitFuncs = append(atexitFuncs, f)
-}
-
 func exit() {
 	for _, f := range atexitFuncs {
 		f()
 	}
 	os.Exit(exitStatus)
-}
-
-func debug(params ...interface{}) {
-	glog.V(4).Infoln(params...)
 }

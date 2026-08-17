@@ -26,7 +26,15 @@ func (t *Topology) StartRefreshWritableVolumes(grpcDialOption grpc.DialOption, g
 	go func(garbageThreshold float64) {
 		for {
 			if t.IsLeader() {
-				if !t.isDisableVacuum {
+				// Safety net: if vacuum was disabled by the plugin monitor but the
+				// admin server is no longer connected, automatically re-enable.
+				// This handles the case where the admin server crashes without
+				// cleanup. Does NOT override an operator's intentional disable.
+				if t.IsVacuumDisabledByPlugin() && t.adminServerConnectedFunc != nil && !t.adminServerConnectedFunc() {
+					glog.V(0).Infof("Admin server disconnected while vacuum was disabled by plugin, clearing plugin disable")
+					t.EnableVacuumByPlugin()
+				}
+				if !t.IsVacuumDisabled() {
 					t.Vacuum(grpcDialOption, garbageThreshold, concurrentVacuumLimitPerVolumeServer, 0, "", preallocate, true)
 				}
 			} else {
@@ -100,6 +108,7 @@ func (t *Topology) UnRegisterDataNode(dn *DataNode) {
 	}
 	dn.DeltaUpdateVolumes([]storage.VolumeInfo{}, dn.GetVolumes())
 	dn.DeltaUpdateEcShards([]*erasure_coding.EcVolumeInfo{}, dn.GetEcShards())
+	t.unregisterDataNodeAddress(dn.ServerAddress(), dn)
 	if dn.Parent() != nil {
 		dn.Parent().UnlinkChildNode(dn.Id())
 	}

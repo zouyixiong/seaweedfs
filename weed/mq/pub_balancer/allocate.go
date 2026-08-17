@@ -1,13 +1,34 @@
 package pub_balancer
 
 import (
+	"math/rand/v2"
+	"time"
+
 	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/schema_pb"
-	"math/rand"
-	"time"
 )
+
+// findActiveBroker looks up a broker in activeBrokers, tolerating address
+// encoding differences (plain host:port vs host:port.grpcPort) by falling
+// back to an Equals-based scan when the direct key lookup misses.
+func findActiveBroker(activeBrokers cmap.ConcurrentMap[string, *BrokerStats], addr string) (string, bool) {
+	if addr == "" {
+		return "", false
+	}
+	if _, found := activeBrokers.Get(addr); found {
+		return addr, true
+	}
+	target := pb.ServerAddress(addr)
+	for item := range activeBrokers.IterBuffered() {
+		if pb.ServerAddress(item.Key).Equals(target) {
+			return item.Key, true
+		}
+	}
+	return "", false
+}
 
 func AllocateTopicPartitions(brokers cmap.ConcurrentMap[string, *BrokerStats], partitionCount int32) (assignments []*mq_pb.BrokerPartitionAssignment) {
 	// divide the ring into partitions
@@ -43,7 +64,7 @@ func pickBrokers(brokers cmap.ConcurrentMap[string, *BrokerStats], count int32) 
 	}
 	pickedBrokers := make([]string, 0, count)
 	for i := int32(0); i < count; i++ {
-		p := rand.Intn(len(candidates))
+		p := rand.IntN(len(candidates))
 		pickedBrokers = append(pickedBrokers, candidates[p])
 	}
 	return pickedBrokers
@@ -59,7 +80,7 @@ func pickBrokersExcluded(brokers []string, count int, excludedLeadBroker string,
 		if len(pickedBrokers) < count {
 			pickedBrokers = append(pickedBrokers, broker)
 		} else {
-			j := rand.Intn(i + 1)
+			j := rand.IntN(i + 1)
 			if j < count {
 				pickedBrokers[j] = broker
 			}
@@ -69,7 +90,7 @@ func pickBrokersExcluded(brokers []string, count int, excludedLeadBroker string,
 	// shuffle the picked brokers
 	count = len(pickedBrokers)
 	for i := 0; i < count; i++ {
-		j := rand.Intn(count)
+		j := rand.IntN(count)
 		pickedBrokers[i], pickedBrokers[j] = pickedBrokers[j], pickedBrokers[i]
 	}
 
@@ -78,7 +99,7 @@ func pickBrokersExcluded(brokers []string, count int, excludedLeadBroker string,
 
 // EnsureAssignmentsToActiveBrokers ensures the assignments are assigned to active brokers
 func EnsureAssignmentsToActiveBrokers(activeBrokers cmap.ConcurrentMap[string, *BrokerStats], followerCount int, assignments []*mq_pb.BrokerPartitionAssignment) (hasChanges bool) {
-	glog.V(0).Infof("EnsureAssignmentsToActiveBrokers: activeBrokers: %v, followerCount: %d, assignments: %v", activeBrokers.Count(), followerCount, assignments)
+	glog.V(4).Infof("EnsureAssignmentsToActiveBrokers: activeBrokers: %v, followerCount: %d, assignments: %v", activeBrokers.Count(), followerCount, assignments)
 
 	candidates := make([]string, 0, activeBrokers.Count())
 	for brokerStatsItem := range activeBrokers.IterBuffered() {
@@ -90,15 +111,21 @@ func EnsureAssignmentsToActiveBrokers(activeBrokers cmap.ConcurrentMap[string, *
 		count := 0
 		if assignment.LeaderBroker == "" {
 			count++
-		} else if _, found := activeBrokers.Get(assignment.LeaderBroker); !found {
+		} else if canonical, found := findActiveBroker(activeBrokers, assignment.LeaderBroker); !found {
 			assignment.LeaderBroker = ""
 			count++
+		} else if canonical != assignment.LeaderBroker {
+			assignment.LeaderBroker = canonical
+			hasChanges = true
 		}
 		if assignment.FollowerBroker == "" {
 			count++
-		} else if _, found := activeBrokers.Get(assignment.FollowerBroker); !found {
+		} else if canonical, found := findActiveBroker(activeBrokers, assignment.FollowerBroker); !found {
 			assignment.FollowerBroker = ""
 			count++
+		} else if canonical != assignment.FollowerBroker {
+			assignment.FollowerBroker = canonical
+			hasChanges = true
 		}
 
 		if count > 0 {
@@ -122,6 +149,6 @@ func EnsureAssignmentsToActiveBrokers(activeBrokers cmap.ConcurrentMap[string, *
 
 	}
 
-	glog.V(0).Infof("EnsureAssignmentsToActiveBrokers: activeBrokers: %v, followerCount: %d, assignments: %v hasChanges: %v", activeBrokers.Count(), followerCount, assignments, hasChanges)
+	glog.V(4).Infof("EnsureAssignmentsToActiveBrokers: activeBrokers: %v, followerCount: %d, assignments: %v hasChanges: %v", activeBrokers.Count(), followerCount, assignments, hasChanges)
 	return
 }

@@ -5,10 +5,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/filer"
-	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"io"
 	"math"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 func init() {
@@ -55,7 +56,7 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 	var filerBucketsPath string
 	filerBucketsPath, err = readFilerBucketsPath(commandEnv)
 	if err != nil {
-		return fmt.Errorf("read buckets: %v", err)
+		return fmt.Errorf("read buckets: %w", err)
 	}
 
 	// read existing filer configuration
@@ -73,7 +74,7 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 		collection := getCollectionName(commandEnv, entry.Name)
 		var collectionSize float64
 		if collectionInfo, found := collectionInfos[collection]; found {
-			collectionSize = collectionInfo.Size
+			collectionSize = collectionInfo.LogicalSize()
 		}
 		if c.processEachBucket(fc, filerBucketsPath, entry, writer, collectionSize) {
 			hasConfChanges = true
@@ -81,7 +82,7 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 		return nil
 	}, "", false, math.MaxUint32)
 	if err != nil {
-		return fmt.Errorf("list buckets under %v: %v", filerBucketsPath, err)
+		return fmt.Errorf("list buckets under %v: %w", filerBucketsPath, err)
 	}
 
 	// apply the configuration changes
@@ -91,7 +92,7 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 		fc.ToText(&buf2)
 
 		if err = commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
-			return filer.SaveInsideFiler(client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf2.Bytes())
+			return filer.SaveInsideFiler(context.Background(), client, filer.DirectoryEtcSeaweedFS, filer.FilerConfName, buf2.Bytes())
 		}); err != nil && err != filer_pb.ErrNotFound {
 			return err
 		}
@@ -104,38 +105,17 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 func (c *commandS3BucketQuotaEnforce) processEachBucket(fc *filer.FilerConf, filerBucketsPath string, entry *filer_pb.Entry, writer io.Writer, collectionSize float64) (hasConfChanges bool) {
 
 	locPrefix := filerBucketsPath + "/" + entry.Name + "/"
-	locConf := fc.MatchStorageRule(locPrefix)
-	locConf.LocationPrefix = locPrefix
 
-	if entry.Quota > 0 {
-		if locConf.ReadOnly {
-			if collectionSize < float64(entry.Quota) {
-				locConf.ReadOnly = false
-				hasConfChanges = true
-			}
-		} else {
-			if collectionSize > float64(entry.Quota) {
-				locConf.ReadOnly = true
-				hasConfChanges = true
-			}
-		}
-	} else {
-		if locConf.ReadOnly {
-			locConf.ReadOnly = false
-			hasConfChanges = true
-		}
-	}
-
+	readOnly, hasConfChanges := fc.ApplyBucketQuotaReadOnly(locPrefix, collectionSize, float64(entry.Quota))
 	if hasConfChanges {
 		fmt.Fprintf(writer, "  %s\tsize:%.0f", entry.Name, collectionSize)
 		fmt.Fprintf(writer, "\tquota:%d\tusage:%.2f%%", entry.Quota, collectionSize*100/float64(entry.Quota))
 		fmt.Fprintln(writer)
-		if locConf.ReadOnly {
+		if readOnly {
 			fmt.Fprintf(writer, "    changing bucket %s to read only!\n", entry.Name)
 		} else {
 			fmt.Fprintf(writer, "    changing bucket %s to writable.\n", entry.Name)
 		}
-		fc.SetLocationConf(locConf)
 	}
 
 	return

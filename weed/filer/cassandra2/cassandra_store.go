@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/gocql/gocql"
+	"os"
+	"strings"
 	"time"
+
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -28,14 +31,25 @@ func (store *Cassandra2Store) GetName() string {
 }
 
 func (store *Cassandra2Store) Initialize(configuration util.Configuration, prefix string) (err error) {
+	// Without this, an env-var config that omits the key drops cluster.Timeout to 0.
+	configuration.SetDefault(prefix+"connection_timeout_millisecond", 600)
+	enableHostVerification := true
+	if val := configuration.GetString(prefix + "ssl_enable_host_verification"); val != "" {
+		enableHostVerification = configuration.GetBool(prefix + "ssl_enable_host_verification")
+	}
+
 	return store.initialize(
 		configuration.GetString(prefix+"keyspace"),
 		configuration.GetStringSlice(prefix+"hosts"),
 		configuration.GetString(prefix+"username"),
 		configuration.GetString(prefix+"password"),
+		configuration.GetString(prefix+"ssl_ca_path"),
+		configuration.GetString(prefix+"ssl_cert_path"),
+		configuration.GetString(prefix+"ssl_key_path"),
 		configuration.GetStringSlice(prefix+"superLargeDirectories"),
 		configuration.GetString(prefix+"localDC"),
 		configuration.GetInt(prefix+"connection_timeout_millisecond"),
+		enableHostVerification,
 	)
 }
 
@@ -44,10 +58,49 @@ func (store *Cassandra2Store) isSuperLargeDirectory(dir string) (dirHash string,
 	return
 }
 
-func (store *Cassandra2Store) initialize(keyspace string, hosts []string, username string, password string, superLargeDirectories []string, localDC string, timeout int) (err error) {
+func (store *Cassandra2Store) initialize(keyspace string, hosts []string, username string, password string, sslCaPath string, sslCertPath string, sslKeyPath string, superLargeDirectories []string, localDC string, timeout int, enableHostVerification bool) (err error) {
 	store.cluster = gocql.NewCluster(hosts...)
 	if username != "" && password != "" {
 		store.cluster.Authenticator = gocql.PasswordAuthenticator{Username: username, Password: password}
+	}
+	if sslCaPath != "" || sslCertPath != "" || sslKeyPath != "" {
+		if (sslCertPath != "" && sslKeyPath == "") || (sslCertPath == "" && sslKeyPath != "") {
+			return fmt.Errorf("both ssl_cert_path and ssl_key_path must be provided for mTLS, or neither")
+		}
+
+		for _, path := range []string{sslCaPath, sslCertPath, sslKeyPath} {
+			if path != "" {
+				if _, err := os.Stat(path); err != nil {
+					return fmt.Errorf("ssl file %s not found: %v", path, err)
+				}
+			}
+		}
+
+		store.cluster.SslOpts = &gocql.SslOptions{
+			CaPath:                 sslCaPath,
+			CertPath:               sslCertPath,
+			KeyPath:                sslKeyPath,
+			EnableHostVerification: enableHostVerification,
+		}
+
+		// check if port is already specified in hosts
+		hasPort := false
+		for _, host := range hosts {
+			if strings.Contains(host, ":") {
+				hasPort = true
+				break
+			}
+		}
+		if !hasPort {
+			// standard cassandra port is 9042, but AWS keyspaces uses 9142
+			store.cluster.Port = 9142
+		}
+
+		if sslCertPath != "" {
+			glog.V(0).Infof("TLS enabled: mTLS with cert %s", sslCertPath)
+		} else {
+			glog.V(0).Infof("TLS enabled: server-verification with ca %s", sslCaPath)
+		}
 	}
 	store.cluster.Keyspace = keyspace
 	store.cluster.Timeout = time.Duration(timeout) * time.Millisecond
@@ -202,15 +255,27 @@ func (store *Cassandra2Store) ListDirectoryEntries(ctx context.Context, dirPath 
 		lastFileName = name
 		if decodeErr := entry.DecodeAttributesAndChunks(util.MaybeDecompressData(data)); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			err = fmt.Errorf("failed to process eachEntryFunc for entry %q: %w", entry.FullPath, resEachEntryFuncErr)
+			glog.V(0).InfofCtx(ctx, "failed to process eachEntryFunc for entry %q: %v", entry.FullPath, resEachEntryFuncErr)
+			break
+		}
+
+		if !resEachEntryFunc {
 			break
 		}
 	}
-	if err = iter.Close(); err != nil {
-		glog.V(0).Infof("list iterator close: %v", err)
+
+	if errClose := iter.Close(); errClose != nil {
+		glog.V(0).InfofCtx(ctx, "list iterator close: %v", errClose)
+		if err == nil {
+			return lastFileName, errClose
+		}
 	}
 
 	return lastFileName, err

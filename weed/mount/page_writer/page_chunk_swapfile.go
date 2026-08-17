@@ -1,12 +1,14 @@
 package page_writer
 
 import (
-	"github.com/seaweedfs/seaweedfs/weed/glog"
-	"github.com/seaweedfs/seaweedfs/weed/util"
-	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 )
 
 var (
@@ -31,6 +33,7 @@ type SwapFileChunk struct {
 	logicChunkIndex  LogicChunkIndex
 	actualChunkIndex ActualChunkIndex
 	activityScore    *ActivityScore
+	lastWriteTsNs    atomic.Int64
 	//memChunk         *MemChunk
 }
 
@@ -42,23 +45,34 @@ func NewSwapFile(dir string, chunkSize int64) *SwapFile {
 	}
 }
 func (sf *SwapFile) FreeResource() {
+	sf.chunkTrackingLock.Lock()
+	defer sf.chunkTrackingLock.Unlock()
 	if sf.file != nil {
 		sf.file.Close()
 		os.Remove(sf.file.Name())
+		sf.file = nil
 	}
 }
 
 func (sf *SwapFile) NewSwapFileChunk(logicChunkIndex LogicChunkIndex) (tc *SwapFileChunk) {
+	sf.chunkTrackingLock.Lock()
+	defer sf.chunkTrackingLock.Unlock()
+
 	if sf.file == nil {
 		var err error
 		sf.file, err = os.CreateTemp(sf.dir, "")
+		if os.IsNotExist(err) {
+			if mkdirErr := os.MkdirAll(sf.dir, 0700); mkdirErr != nil {
+				glog.Errorf("create/recreate swap directory %s: %v", sf.dir, mkdirErr)
+				return nil
+			}
+			sf.file, err = os.CreateTemp(sf.dir, "")
+		}
 		if err != nil {
-			glog.Errorf("create swap file: %v", err)
+			glog.Errorf("create swap file in %s: %v", sf.dir, err)
 			return nil
 		}
 	}
-	sf.chunkTrackingLock.Lock()
-	defer sf.chunkTrackingLock.Unlock()
 
 	sf.activeChunkCount++
 
@@ -112,6 +126,7 @@ func (sc *SwapFileChunk) WriteDataAt(src []byte, offset int64, tsNs int64) (n in
 	}
 	//sc.memChunk.WriteDataAt(src, offset, tsNs)
 	sc.activityScore.MarkWrite()
+	sc.lastWriteTsNs.Store(tsNs)
 
 	return
 }
@@ -139,10 +154,6 @@ func (sc *SwapFileChunk) ReadDataAt(p []byte, off int64, tsNs int64) (maxStop in
 				break
 			}
 			maxStop = max(maxStop, logicStop)
-
-			if t.TsNs > tsNs {
-				println("read new data2", t.TsNs-tsNs, "ns")
-			}
 		}
 	}
 	//sc.memChunk.ReadDataAt(memCopy, off, tsNs)
@@ -161,6 +172,12 @@ func (sc *SwapFileChunk) IsComplete() bool {
 	return sc.usage.IsComplete(sc.swapfile.chunkSize)
 }
 
+func (sc *SwapFileChunk) IsContiguouslyWritten() bool {
+	sc.RLock()
+	defer sc.RUnlock()
+	return sc.usage.IsContiguouslyWritten()
+}
+
 func (sc *SwapFileChunk) ActivityScore() int64 {
 	return sc.activityScore.ActivityScore()
 }
@@ -169,6 +186,10 @@ func (sc *SwapFileChunk) WrittenSize() int64 {
 	sc.RLock()
 	defer sc.RUnlock()
 	return sc.usage.WrittenSize()
+}
+
+func (sc *SwapFileChunk) LastWriteTsNs() int64 {
+	return sc.lastWriteTsNs.Load()
 }
 
 func (sc *SwapFileChunk) SaveContent(saveFn SaveToStorageFunc) {

@@ -2,8 +2,9 @@ package topic
 
 import (
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb/schema_pb"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/schema_pb"
 )
 
 const PartitionCount = 4096
@@ -13,15 +14,6 @@ type Partition struct {
 	RangeStop  int32 // exclusive
 	RingSize   int32
 	UnixTimeNs int64 // in nanoseconds
-}
-
-func NewPartition(rangeStart, rangeStop, ringSize int32, unixTimeNs int64) *Partition {
-	return &Partition{
-		RangeStart: rangeStart,
-		RangeStop:  rangeStop,
-		RingSize:   ringSize,
-		UnixTimeNs: unixTimeNs,
-	}
 }
 
 func (partition Partition) Equals(other Partition) bool {
@@ -40,6 +32,13 @@ func (partition Partition) Equals(other Partition) bool {
 	return true
 }
 
+// LogicalEquals compares only the partition boundaries (RangeStart, RangeStop)
+// This is useful when comparing partitions that may have different timestamps or ring sizes
+// but represent the same logical partition range
+func (partition Partition) LogicalEquals(other Partition) bool {
+	return partition.RangeStart == other.RangeStart && partition.RangeStop == other.RangeStop
+}
+
 func FromPbPartition(partition *schema_pb.Partition) Partition {
 	return Partition{
 		RangeStart: partition.RangeStart,
@@ -47,24 +46,6 @@ func FromPbPartition(partition *schema_pb.Partition) Partition {
 		RingSize:   partition.RingSize,
 		UnixTimeNs: partition.UnixTimeNs,
 	}
-}
-
-func SplitPartitions(targetCount int32, ts int64) []*Partition {
-	partitions := make([]*Partition, 0, targetCount)
-	partitionSize := PartitionCount / targetCount
-	for i := int32(0); i < targetCount; i++ {
-		partitionStop := (i + 1) * partitionSize
-		if i == targetCount-1 {
-			partitionStop = PartitionCount
-		}
-		partitions = append(partitions, &Partition{
-			RangeStart: i * partitionSize,
-			RangeStop:  partitionStop,
-			RingSize:   PartitionCount,
-			UnixTimeNs: ts,
-		})
-	}
-	return partitions
 }
 
 func (partition Partition) ToPbPartition() *schema_pb.Partition {

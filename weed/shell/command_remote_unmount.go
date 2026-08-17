@@ -4,12 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"io"
-	"time"
 )
 
 func init() {
@@ -67,13 +68,13 @@ func (c *commandRemoteUnmount) Do(args []string, commandEnv *CommandEnv, writer 
 	// store a mount configuration in filer
 	fmt.Fprintf(writer, "deleting mount for %s ...\n", *dir)
 	if err = filer.DeleteMountMapping(commandEnv, *dir); err != nil {
-		return fmt.Errorf("delete mount mapping: %v", err)
+		return fmt.Errorf("delete mount mapping: %w", err)
 	}
 
 	// purge mounted data
 	fmt.Fprintf(writer, "purge %s ...\n", *dir)
 	if err = c.purgeMountedData(commandEnv, *dir); err != nil {
-		return fmt.Errorf("purge mounted data: %v", err)
+		return fmt.Errorf("purge mounted data: %w", err)
 	}
 
 	// reset remote sync offset in case the folder is mounted again
