@@ -2,11 +2,12 @@ package needle
 
 import (
 	"fmt"
+	"io"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"io"
 )
 
 // ReadNeedleData uses a needle without n.Data to read the content
@@ -54,6 +55,7 @@ func (n *Needle) ReadNeedleMeta(r backend.BackendStorageFile, offset int64, size
 		if OffsetSize == 4 && offset < int64(MaxPossibleVolumeSize) {
 			return ErrorSizeMismatch
 		}
+		return fmt.Errorf("size mismatch for entry at offset %d: found id %x size %d, expected size %d", offset, n.Id, n.Size, size)
 	}
 	n.DataSize = util.BytesToUint32(bytes[NeedleHeaderSize : NeedleHeaderSize+DataSizeSize])
 	startOffset := offset + NeedleHeaderSize
@@ -63,6 +65,9 @@ func (n *Needle) ReadNeedleMeta(r backend.BackendStorageFile, offset int64, size
 	dataSize := GetActualSize(size, version)
 	stopOffset := offset + dataSize
 	metaSize := stopOffset - startOffset
+	if metaSize < 0 || metaSize > 128*1024 {
+		return fmt.Errorf("invalid needle meta size %d: DataSize=%d, size=%d, offset=%d", metaSize, n.DataSize, size, offset)
+	}
 	metaSlice := make([]byte, int(metaSize))
 
 	count, err = r.ReadAt(metaSlice, startOffset)
@@ -78,10 +83,7 @@ func (n *Needle) ReadNeedleMeta(r backend.BackendStorageFile, offset int64, size
 		index, err = n.readNeedleDataVersion2NonData(metaSlice)
 	}
 
-	n.Checksum = CRC(util.BytesToUint32(metaSlice[index : index+NeedleChecksumSize]))
-	if version == Version3 {
-		n.AppendAtNs = util.BytesToUint64(metaSlice[index+NeedleChecksumSize : index+NeedleChecksumSize+TimestampSize])
-	}
+	err = n.readNeedleTail(metaSlice[index:], version)
 	return err
 
 }

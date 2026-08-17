@@ -2,12 +2,14 @@ package meta_cache
 
 import (
 	"context"
+	"io"
+	"strings"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"strings"
 )
 
 type MetadataFollower struct {
@@ -42,7 +44,7 @@ func mergeProcessors(mainProcessor func(resp *filer_pb.SubscribeMetadataResponse
 	}
 }
 
-func SubscribeMetaEvents(mc *MetaCache, selfSignature int32, client filer_pb.FilerClient, dir string, lastTsNs int64, followers ...*MetadataFollower) error {
+func SubscribeMetaEvents(mc *MetaCache, selfSignature int32, client filer_pb.FilerClient, dir string, lastTsNs int64, skipSelfEvents bool, onRetry func(lastTsNs int64, err error), followers ...*MetadataFollower) error {
 
 	var prefixes []string
 	for _, follower := range followers {
@@ -50,49 +52,15 @@ func SubscribeMetaEvents(mc *MetaCache, selfSignature int32, client filer_pb.Fil
 	}
 
 	processEventFn := func(resp *filer_pb.SubscribeMetadataResponse) error {
-		message := resp.EventNotification
-
-		for _, sig := range message.Signatures {
-			if sig == selfSignature && selfSignature != 0 {
-				return nil
-			}
-		}
-
-		dir := resp.Directory
-		var oldPath util.FullPath
-		var newEntry *filer.Entry
-		if message.OldEntry != nil {
-			oldPath = util.NewFullPath(dir, message.OldEntry.Name)
-			glog.V(4).Infof("deleting %v", oldPath)
-		}
-
-		if message.NewEntry != nil {
-			if message.NewParentPath != "" {
-				dir = message.NewParentPath
-			}
-			key := util.NewFullPath(dir, message.NewEntry.Name)
-			glog.V(4).Infof("creating %v", key)
-			newEntry = filer.FromPbEntry(dir, message.NewEntry)
-		}
-		err := mc.AtomicUpdateEntryFromFiler(context.Background(), oldPath, newEntry)
-		if err == nil {
-			if message.OldEntry != nil && message.NewEntry != nil {
-				oldKey := util.NewFullPath(resp.Directory, message.OldEntry.Name)
-				mc.invalidateFunc(oldKey, message.OldEntry)
-				if message.OldEntry.Name != message.NewEntry.Name {
-					newKey := util.NewFullPath(dir, message.NewEntry.Name)
-					mc.invalidateFunc(newKey, message.NewEntry)
+		if skipSelfEvents && resp.EventNotification != nil {
+			for _, sig := range resp.EventNotification.Signatures {
+				if sig == selfSignature {
+					glog.V(4).Infof("skip self-originated event %s", resp.Directory)
+					return nil
 				}
-			} else if filer_pb.IsCreate(resp) {
-				// no need to invalidate
-			} else if filer_pb.IsDelete(resp) {
-				oldKey := util.NewFullPath(resp.Directory, message.OldEntry.Name)
-				mc.invalidateFunc(oldKey, message.OldEntry)
 			}
 		}
-
-		return err
-
+		return mc.ApplyMetadataResponse(context.Background(), resp, SubscriberMetadataResponseApplyOptions)
 	}
 
 	prefix := dir
@@ -100,6 +68,9 @@ func SubscribeMetaEvents(mc *MetaCache, selfSignature int32, client filer_pb.Fil
 		prefix = prefix + "/"
 	}
 
+	// Read persisted log chunks directly from volume servers, keeping the replay
+	// cost off the filer's heap (see LogFileReaderFn below).
+	lookupFn := filer.LookupFn(client)
 	metadataFollowOption := &pb.MetadataFollowOption{
 		ClientName:             "mount",
 		ClientId:               selfSignature,
@@ -111,11 +82,17 @@ func SubscribeMetaEvents(mc *MetaCache, selfSignature int32, client filer_pb.Fil
 		StartTsNs:              lastTsNs,
 		StopTsNs:               0,
 		EventErrorType:         pb.FatalOnError,
+		LogFileReaderFn: func(chunks []*filer_pb.FileChunk) (io.ReadCloser, error) {
+			return filer.NewChunkStreamReaderFromLookup(context.Background(), lookupFn, chunks), nil
+		},
 	}
 	util.RetryUntil("followMetaUpdates", func() error {
 		metadataFollowOption.ClientEpoch++
 		return pb.WithFilerClientFollowMetadata(client, metadataFollowOption, mergeProcessors(processEventFn, followers...))
 	}, func(err error) bool {
+		if onRetry != nil {
+			onRetry(metadataFollowOption.StartTsNs, err)
+		}
 		glog.Errorf("follow metadata updates: %v", err)
 		return true
 	})

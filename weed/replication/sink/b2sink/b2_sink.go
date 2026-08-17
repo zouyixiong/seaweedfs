@@ -2,12 +2,13 @@ package B2Sink
 
 import (
 	"context"
-	"github.com/seaweedfs/seaweedfs/weed/replication/repl_util"
+	"fmt"
 	"strings"
 
 	"github.com/kurin/blazer/b2"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/replication/repl_util"
 	"github.com/seaweedfs/seaweedfs/weed/replication/sink"
 	"github.com/seaweedfs/seaweedfs/weed/replication/source"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -99,7 +100,7 @@ func (g *B2Sink) CreateEntry(key string, entry *filer_pb.Entry, signatures []int
 	}
 
 	totalSize := filer.FileSize(entry)
-	chunkViews := filer.ViewFromChunks(g.filerSource.LookupFileId, entry.GetChunks(), 0, int64(totalSize))
+	chunkViews := filer.ViewFromChunks(context.Background(), g.filerSource.LookupFileId, entry.GetChunks(), 0, int64(totalSize))
 
 	bucket, err := g.client.Bucket(context.Background(), g.bucket)
 	if err != nil {
@@ -116,10 +117,14 @@ func (g *B2Sink) CreateEntry(key string, entry *filer_pb.Entry, signatures []int
 	}
 
 	if len(entry.Content) > 0 {
-		return writeFunc(entry.Content)
+		content, err := repl_util.MaybeDecryptContent(entry.Content, entry)
+		if err != nil {
+			return fmt.Errorf("decrypt inline SSE content: %w", err)
+		}
+		return writeFunc(content)
 	}
 
-	if err := repl_util.CopyFromChunkViews(chunkViews, g.filerSource, writeFunc); err != nil {
+	if err := repl_util.CopyFromChunkViews(chunkViews, g.filerSource, writeFunc, entry); err != nil {
 		return err
 	}
 

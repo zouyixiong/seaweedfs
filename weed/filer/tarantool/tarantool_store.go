@@ -1,5 +1,4 @@
 //go:build tarantool
-// +build tarantool
 
 package tarantool
 
@@ -15,9 +14,10 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
-	"github.com/tarantool/go-tarantool/v2"
-	"github.com/tarantool/go-tarantool/v2/crud"
-	"github.com/tarantool/go-tarantool/v2/pool"
+	"github.com/tarantool/go-option"
+	"github.com/tarantool/go-tarantool/v3"
+	"github.com/tarantool/go-tarantool/v3/crud"
+	"github.com/tarantool/go-tarantool/v3/pool"
 )
 
 const (
@@ -29,7 +29,7 @@ func init() {
 }
 
 type TarantoolStore struct {
-	pool *pool.ConnectionPool
+	pool *pool.Pool
 }
 
 func (store *TarantoolStore) GetName() string {
@@ -51,39 +51,37 @@ func (store *TarantoolStore) Initialize(configuration weed_util.Configuration, p
 	timeoutStr := configuration.GetString(prefix + "timeout")
 	timeout, err := time.ParseDuration(timeoutStr)
 	if err != nil {
-		return fmt.Errorf("parse tarantool store timeout: %v", err)
+		return fmt.Errorf("parse tarantool store timeout: %w", err)
 	}
 
-	maxReconnects := configuration.GetInt(prefix + "maxReconnects")
-	if maxReconnects < 0 {
-		return fmt.Errorf("maxReconnects is negative")
+	if maxReconnects := configuration.GetInt(prefix + "maxReconnects"); maxReconnects != 1000 {
+		glog.Warningf("tarantool store: \"maxReconnects\" is no longer supported with go-tarantool v3 (the connection pool manages reconnection internally); ignoring configured value %d", maxReconnects)
 	}
 
 	addresses := strings.Split(address, ",")
 
-	return store.initialize(addresses, user, password, timeout, uint(maxReconnects))
+	return store.initialize(addresses, user, password, timeout)
 }
 
-func (store *TarantoolStore) initialize(addresses []string, user string, password string, timeout time.Duration, maxReconnects uint) error {
+func (store *TarantoolStore) initialize(addresses []string, user string, password string, timeout time.Duration) error {
 
 	opts := tarantool.Opts{
-		Timeout:       timeout,
-		Reconnect:     time.Second,
-		MaxReconnects: maxReconnects,
+		Timeout: timeout,
 	}
 
 	poolInstances := makePoolInstances(addresses, user, password, opts)
 	poolOpts := pool.Opts{
 		CheckTimeout: time.Second,
+		Logger:       newGlogLogger(),
 	}
 
 	ctx := context.Background()
-	p, err := pool.ConnectWithOpts(ctx, poolInstances, poolOpts)
+	p, err := pool.NewWithOpts(ctx, poolInstances, poolOpts)
 	if err != nil {
-		return fmt.Errorf("Can't create connection pool: %v", err)
+		return fmt.Errorf("Can't create connection pool: %w", err)
 	}
 
-	_, err = p.Do(tarantool.NewPingRequest(), pool.ANY).Get()
+	_, err = p.Do(tarantool.NewPingRequest(), pool.ModeAny).Get()
 	if err != nil {
 		return err
 	}
@@ -151,13 +149,13 @@ func (store *TarantoolStore) InsertEntry(ctx context.Context, entry *filer.Entry
 		},
 	}
 
-	req := crud.MakeUpsertRequest(tarantoolSpaceName).
+	req := crud.NewUpsertRequest(tarantoolSpaceName).
 		Tuple([]interface{}{dir, nil, name, ttl, string(meta)}).
 		Operations(operations)
 
 	ret := crud.Result{}
 
-	if err := store.pool.Do(req, pool.RW).GetTyped(&ret); err != nil {
+	if err := store.pool.Do(req, pool.ModeRW).GetTyped(&ret); err != nil {
 		return fmt.Errorf("insert %s: %s", entry.FullPath, err)
 	}
 
@@ -172,19 +170,19 @@ func (store *TarantoolStore) FindEntry(ctx context.Context, fullpath weed_util.F
 	dir, name := fullpath.DirAndName()
 
 	findEntryGetOpts := crud.GetOpts{
-		Fields:        crud.MakeOptTuple([]interface{}{"data"}),
-		Mode:          crud.MakeOptString("read"),
-		PreferReplica: crud.MakeOptBool(true),
-		Balance:       crud.MakeOptBool(true),
+		Fields:        option.SomeAny([]interface{}{"data"}),
+		Mode:          option.SomeString("read"),
+		PreferReplica: option.SomeBool(true),
+		Balance:       option.SomeBool(true),
 	}
 
-	req := crud.MakeGetRequest(tarantoolSpaceName).
-		Key(crud.Tuple([]interface{}{dir, name})).
+	req := crud.NewGetRequest(tarantoolSpaceName).
+		Key([]interface{}{dir, name}).
 		Opts(findEntryGetOpts)
 
 	resp := crud.Result{}
 
-	err = store.pool.Do(req, pool.PreferRO).GetTyped(&resp)
+	err = store.pool.Do(req, pool.ModePreferRO).GetTyped(&resp)
 	if err != nil {
 		return nil, err
 	}
@@ -220,14 +218,14 @@ func (store *TarantoolStore) DeleteEntry(ctx context.Context, fullpath weed_util
 	dir, name := fullpath.DirAndName()
 
 	delOpts := crud.DeleteOpts{
-		Noreturn: crud.MakeOptBool(true),
+		Noreturn: option.SomeBool(true),
 	}
 
-	req := crud.MakeDeleteRequest(tarantoolSpaceName).
-		Key(crud.Tuple([]interface{}{dir, name})).
+	req := crud.NewDeleteRequest(tarantoolSpaceName).
+		Key([]interface{}{dir, name}).
 		Opts(delOpts)
 
-	if _, err := store.pool.Do(req, pool.RW).Get(); err != nil {
+	if _, err := store.pool.Do(req, pool.ModeRW).Get(); err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
 	}
 
@@ -238,7 +236,7 @@ func (store *TarantoolStore) DeleteFolderChildren(ctx context.Context, fullpath 
 	req := tarantool.NewCallRequest("filer_metadata.delete_by_directory_idx").
 		Args([]interface{}{fullpath})
 
-	if _, err := store.pool.Do(req, pool.RW).Get(); err != nil {
+	if _, err := store.pool.Do(req, pool.ModeRW).Get(); err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
 	}
 
@@ -254,45 +252,45 @@ func (store *TarantoolStore) ListDirectoryEntries(ctx context.Context, dirPath w
 	req := tarantool.NewCallRequest("filer_metadata.find_by_directory_idx_and_name").
 		Args([]interface{}{string(dirPath), startFileName, includeStartFile, limit})
 
-	results, err := store.pool.Do(req, pool.PreferRO).Get()
+	results, err := store.pool.Do(req, pool.ModePreferRO).Get()
 	if err != nil {
 		return
 	}
 
 	if len(results) < 1 {
-		glog.Errorf("Can't find results, data is empty")
+		glog.ErrorfCtx(ctx, "Can't find results, data is empty")
 		return
 	}
 
 	rows, ok := results[0].([]interface{})
 	if !ok {
-		glog.Errorf("Can't convert results[0] to list")
+		glog.ErrorfCtx(ctx, "Can't convert results[0] to list")
 		return
 	}
 
 	for _, result := range rows {
 		row, ok := result.([]interface{})
 		if !ok {
-			glog.Errorf("Can't convert result to list")
+			glog.ErrorfCtx(ctx, "Can't convert result to list")
 			return
 		}
 
 		if len(row) < 5 {
-			glog.Errorf("Length of result is less than needed: %v", len(row))
+			glog.ErrorfCtx(ctx, "Length of result is less than needed: %v", len(row))
 			return
 		}
 
 		nameRaw := row[2]
 		name, ok := nameRaw.(string)
 		if !ok {
-			glog.Errorf("Can't convert name field to string. Actual type: %v, value: %v", reflect.TypeOf(nameRaw), nameRaw)
+			glog.ErrorfCtx(ctx, "Can't convert name field to string. Actual type: %v, value: %v", reflect.TypeOf(nameRaw), nameRaw)
 			return
 		}
 
 		dataRaw := row[4]
 		data, ok := dataRaw.(string)
 		if !ok {
-			glog.Errorf("Can't convert data field to string. Actual type: %v, value: %v", reflect.TypeOf(dataRaw), dataRaw)
+			glog.ErrorfCtx(ctx, "Can't convert data field to string. Actual type: %v, value: %v", reflect.TypeOf(dataRaw), dataRaw)
 			return
 		}
 
@@ -302,10 +300,17 @@ func (store *TarantoolStore) ListDirectoryEntries(ctx context.Context, dirPath w
 		lastFileName = name
 		if decodeErr := entry.DecodeAttributesAndChunks(util.MaybeDecompressData([]byte(data))); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			err = fmt.Errorf("failed to process eachEntryFunc: %w", resEachEntryFuncErr)
+			break
+		}
+
+		if !resEachEntryFunc {
 			break
 		}
 	}

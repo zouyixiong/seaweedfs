@@ -40,6 +40,10 @@ func (c *commandFsMv) HasTag(CommandTag) bool {
 
 func (c *commandFsMv) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
+	if handleHelpRequest(c, args, writer) {
+		return nil
+	}
+
 	if len(args) != 2 {
 		return fmt.Errorf("need to have 2 arguments")
 	}
@@ -62,8 +66,8 @@ func (c *commandFsMv) Do(args []string, commandEnv *CommandEnv, writer io.Writer
 
 		// collect destination entry info
 		destinationRequest := &filer_pb.LookupDirectoryEntryRequest{
-			Name:      destinationDir,
-			Directory: destinationName,
+			Directory: destinationDir,
+			Name:      destinationName,
 		}
 		respDestinationLookupEntry, err := filer_pb.LookupEntry(context.Background(), client, destinationRequest)
 

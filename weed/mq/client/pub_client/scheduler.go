@@ -3,6 +3,12 @@ package pub_client
 import (
 	"context"
 	"fmt"
+	"log"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
@@ -11,11 +17,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	"log"
-	"sort"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 type EachPartitionError struct {
@@ -90,7 +91,7 @@ func (p *TopicPublisher) onEachAssignments(generation int, assignments []*mq_pb.
 		if hasExistingJob {
 			var existingJob *EachPartitionPublishJob
 			existingJob = p.jobs[i]
-			if existingJob.BrokerPartitionAssignment.LeaderBroker == assignment.LeaderBroker {
+			if pb.ServerAddress(existingJob.BrokerPartitionAssignment.LeaderBroker).Equals(pb.ServerAddress(assignment.LeaderBroker)) {
 				existingJob.generation = generation
 				jobs = append(jobs, existingJob)
 				continue
@@ -120,7 +121,7 @@ func (p *TopicPublisher) onEachAssignments(generation int, assignments []*mq_pb.
 		}(job)
 		jobs = append(jobs, job)
 		// TODO assuming this is not re-configured so the partitions are fixed.
-		// better just re-use the existing job
+		// better just reuse the existing job
 		p.partition2Buffer.Insert(assignment.Partition.RangeStart, assignment.Partition.RangeStop, job.inputQueue)
 	}
 	p.jobs = jobs
@@ -137,7 +138,7 @@ func (p *TopicPublisher) doPublishToPartition(job *EachPartitionPublishJob) erro
 	brokerClient := mq_pb.NewSeaweedMessagingClient(grpcConnection)
 	stream, err := brokerClient.PublishMessage(context.Background())
 	if err != nil {
-		return fmt.Errorf("create publish client: %v", err)
+		return fmt.Errorf("create publish client: %w", err)
 	}
 	publishClient := &PublishClient{
 		SeaweedMessaging_PublishMessageClient: stream,
@@ -154,12 +155,12 @@ func (p *TopicPublisher) doPublishToPartition(job *EachPartitionPublishJob) erro
 			},
 		},
 	}); err != nil {
-		return fmt.Errorf("send init message: %v", err)
+		return fmt.Errorf("send init message: %w", err)
 	}
 	// process the hello message
 	resp, err := stream.Recv()
 	if err != nil {
-		return fmt.Errorf("recv init response: %v", err)
+		return fmt.Errorf("recv init response: %w", err)
 	}
 	if resp.Error != "" {
 		return fmt.Errorf("init response error: %v", resp.Error)
@@ -188,10 +189,10 @@ func (p *TopicPublisher) doPublishToPartition(job *EachPartitionPublishJob) erro
 				log.Printf("publish2 to %s error: %v\n", publishClient.Broker, ackResp.Error)
 				return
 			}
-			if ackResp.AckSequence > 0 {
-				log.Printf("ack %d published %d hasMoreData:%d", ackResp.AckSequence, atomic.LoadInt64(&publishedTsNs), atomic.LoadInt32(&hasMoreData))
+			if ackResp.AckTsNs > 0 {
+				log.Printf("ack %d published %d hasMoreData:%d", ackResp.AckTsNs, atomic.LoadInt64(&publishedTsNs), atomic.LoadInt32(&hasMoreData))
 			}
-			if atomic.LoadInt64(&publishedTsNs) <= ackResp.AckSequence && atomic.LoadInt32(&hasMoreData) == 0 {
+			if atomic.LoadInt64(&publishedTsNs) <= ackResp.AckTsNs && atomic.LoadInt32(&hasMoreData) == 0 {
 				return
 			}
 		}
@@ -208,7 +209,7 @@ func (p *TopicPublisher) doPublishToPartition(job *EachPartitionPublishJob) erro
 				Data: data,
 			},
 		}); err != nil {
-			return fmt.Errorf("send publish data: %v", err)
+			return fmt.Errorf("send publish data: %w", err)
 		}
 		publishCounter++
 		atomic.StoreInt64(&publishedTsNs, data.TsNs)
@@ -218,7 +219,7 @@ func (p *TopicPublisher) doPublishToPartition(job *EachPartitionPublishJob) erro
 	} else {
 		// CloseSend would cancel the context on the server side
 		if err := publishClient.CloseSend(); err != nil {
-			return fmt.Errorf("close send: %v", err)
+			return fmt.Errorf("close send: %w", err)
 		}
 	}
 
@@ -238,9 +239,9 @@ func (p *TopicPublisher) doConfigureTopic() (err error) {
 			p.grpcDialOption,
 			func(client mq_pb.SeaweedMessagingClient) error {
 				_, err := client.ConfigureTopic(context.Background(), &mq_pb.ConfigureTopicRequest{
-					Topic:          p.config.Topic.ToPbTopic(),
-					PartitionCount: p.config.PartitionCount,
-					RecordType:     p.config.RecordType, // TODO schema upgrade
+					Topic:             p.config.Topic.ToPbTopic(),
+					PartitionCount:    p.config.PartitionCount,
+					MessageRecordType: p.config.RecordType, // Flat schema
 				})
 				return err
 			})

@@ -1,10 +1,13 @@
 package filer
 
 import (
+	"bytes"
+	"reflect"
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestFilerConf(t *testing.T) {
@@ -46,4 +49,202 @@ func TestFilerConf(t *testing.T) {
 	assert.Equal(t, true, fc.MatchStorageRule("/buckets/xxx/yyy/zzz").ReadOnly)
 	assert.Equal(t, false, fc.MatchStorageRule("/buckets/other").ReadOnly)
 
+}
+
+func TestWormInheritance(t *testing.T) {
+	fc := NewFilerConf()
+	fc.doLoadConf(&filer_pb.FilerConf{
+		Version: FilerConfVersion,
+		Locations: []*filer_pb.FilerConf_PathConf{
+			{LocationPrefix: "/buckets/b/", Worm: proto.Bool(true), Ttl: "7d"},
+			{LocationPrefix: "/buckets/b/quiet/", Collection: "quiet"},
+			{LocationPrefix: "/buckets/b/scratch/", Worm: proto.Bool(false)},
+			{LocationPrefix: "/buckets/b/scratch/keep/", Worm: proto.Bool(true)},
+		},
+	})
+
+	// a rule that says nothing about worm keeps inheriting it, along with the ttl
+	rule := fc.MatchStorageRule("/buckets/b/quiet/x")
+	assert.True(t, rule.GetWorm())
+	assert.Equal(t, "7d", rule.Ttl)
+
+	// an explicit false turns it off, and a deeper rule turns it back on
+	assert.False(t, fc.MatchStorageRule("/buckets/b/scratch/x").GetWorm())
+	assert.True(t, fc.MatchStorageRule("/buckets/b/scratch/keep/x").GetWorm())
+
+	// paths with no rule at all are unaffected
+	assert.False(t, fc.MatchStorageRule("/buckets/other/x").GetWorm())
+}
+
+// TestWormLegacyFalseIsNotAnOverride pins that the explicit "worm": false every
+// version 0 configuration carries does not read as a per-path opt-out.
+func TestWormLegacyFalseIsNotAnOverride(t *testing.T) {
+	const conf = `{
+	  "locations": [
+	    {"locationPrefix": "/buckets/b/", "worm": true},
+	    {"locationPrefix": "/buckets/b/sub/", "collection": "sub", "worm": false}
+	  ]
+	}`
+
+	fc := NewFilerConf()
+	assert.NoError(t, fc.LoadFromBytes([]byte(conf)))
+	assert.True(t, fc.MatchStorageRule("/buckets/b/sub/x").GetWorm())
+
+	// the same file at the current version means what it says
+	fc = NewFilerConf()
+	assert.NoError(t, fc.LoadFromBytes([]byte(`{"version": 1,`+conf[1:])))
+	assert.False(t, fc.MatchStorageRule("/buckets/b/sub/x").GetWorm())
+}
+
+// TestWormSurvivesRoundTrip guards the write side: an explicit false has to be
+// stamped along with a version that says to honor it.
+func TestWormSurvivesRoundTrip(t *testing.T) {
+	fc := NewFilerConf()
+	fc.SetLocationConf(&filer_pb.FilerConf_PathConf{LocationPrefix: "/buckets/b/", Worm: proto.Bool(true)})
+	fc.SetLocationConf(&filer_pb.FilerConf_PathConf{LocationPrefix: "/buckets/b/sub/", Worm: proto.Bool(false)})
+	fc.SetLocationConf(&filer_pb.FilerConf_PathConf{LocationPrefix: "/buckets/b/other/", Ttl: "7d"})
+
+	var buf bytes.Buffer
+	assert.NoError(t, fc.ToText(&buf))
+
+	reloaded := NewFilerConf()
+	assert.NoError(t, reloaded.LoadFromBytes(buf.Bytes()))
+	assert.False(t, reloaded.MatchStorageRule("/buckets/b/sub/x").GetWorm())
+	assert.True(t, reloaded.MatchStorageRule("/buckets/b/other/x").GetWorm())
+}
+
+// TestClonePathConf verifies that ClonePathConf copies all exported fields.
+// Uses reflection to automatically detect new fields added to the protobuf,
+// ensuring the test fails if ClonePathConf is not updated for new fields.
+func TestClonePathConf(t *testing.T) {
+	// Create a fully-populated PathConf with non-zero values for all fields
+	src := &filer_pb.FilerConf_PathConf{
+		LocationPrefix:           "/test/path",
+		Collection:               "test_collection",
+		Replication:              "001",
+		Ttl:                      "7d",
+		DiskType:                 "ssd",
+		Fsync:                    true,
+		VolumeGrowthCount:        5,
+		ReadOnly:                 true,
+		MaxFileNameLength:        255,
+		DataCenter:               "dc1",
+		Rack:                     "rack1",
+		DataNode:                 "node1",
+		DisableChunkDeletion:     true,
+		Worm:                     proto.Bool(true),
+		WormGracePeriodSeconds:   3600,
+		WormRetentionTimeSeconds: 86400,
+	}
+
+	clone := ClonePathConf(src)
+
+	// Verify it's a different object
+	assert.NotSame(t, src, clone, "ClonePathConf should return a new object, not the same pointer")
+
+	// Use reflection to compare all exported fields
+	// This will automatically catch any new fields added to the protobuf
+	srcVal := reflect.ValueOf(src).Elem()
+	cloneVal := reflect.ValueOf(clone).Elem()
+	srcType := srcVal.Type()
+
+	for i := 0; i < srcType.NumField(); i++ {
+		field := srcType.Field(i)
+
+		// Skip unexported fields (protobuf internal fields like sizeCache, unknownFields)
+		if !field.IsExported() {
+			continue
+		}
+
+		srcField := srcVal.Field(i)
+		cloneField := cloneVal.Field(i)
+
+		// Compare field values
+		if !reflect.DeepEqual(srcField.Interface(), cloneField.Interface()) {
+			t.Errorf("Field %s not copied correctly: src=%v, clone=%v",
+				field.Name, srcField.Interface(), cloneField.Interface())
+		}
+	}
+
+	// Additionally verify that all exported fields in src are non-zero
+	// This ensures we're testing with fully populated data
+	for i := 0; i < srcType.NumField(); i++ {
+		field := srcType.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+
+		srcField := srcVal.Field(i)
+		if srcField.IsZero() {
+			t.Errorf("Test setup error: field %s has zero value, update test to set a non-zero value", field.Name)
+		}
+	}
+
+	// Verify mutation of clone doesn't affect source
+	clone.Collection = "modified"
+	clone.ReadOnly = false
+	*clone.Worm = false
+	assert.Equal(t, "test_collection", src.Collection, "Modifying clone should not affect source Collection")
+	assert.Equal(t, true, src.ReadOnly, "Modifying clone should not affect source ReadOnly")
+	assert.Equal(t, true, src.GetWorm(), "Modifying clone should not affect source Worm")
+}
+
+func TestClonePathConfNil(t *testing.T) {
+	clone := ClonePathConf(nil)
+	assert.NotNil(t, clone, "ClonePathConf(nil) should return a non-nil empty PathConf")
+	assert.Equal(t, "", clone.LocationPrefix, "ClonePathConf(nil) should return empty PathConf")
+}
+
+func TestApplyBucketQuotaReadOnly(t *testing.T) {
+	const prefix = "/buckets/b/"
+
+	// over quota: flips to read-only
+	fc := NewFilerConf()
+	readOnly, changed := fc.ApplyBucketQuotaReadOnly(prefix, 150, 100)
+	assert.True(t, changed)
+	assert.True(t, readOnly)
+	assert.True(t, fc.MatchStorageRule(prefix).ReadOnly)
+
+	// still over quota: no change
+	_, changed = fc.ApplyBucketQuotaReadOnly(prefix, 150, 100)
+	assert.False(t, changed)
+
+	// back under quota: flips to writable
+	readOnly, changed = fc.ApplyBucketQuotaReadOnly(prefix, 50, 100)
+	assert.True(t, changed)
+	assert.False(t, readOnly)
+	assert.False(t, fc.MatchStorageRule(prefix).ReadOnly)
+
+	// quota disabled leaves the flag untouched, so manual locks survive
+	fc = NewFilerConf()
+	fc.ApplyBucketQuotaReadOnly(prefix, 150, 100)
+	readOnly, changed = fc.ApplyBucketQuotaReadOnly(prefix, 150, -1)
+	assert.False(t, changed)
+	assert.True(t, readOnly)
+
+	// under quota and not read-only: no rule churn
+	fc = NewFilerConf()
+	_, changed = fc.ApplyBucketQuotaReadOnly(prefix, 50, 100)
+	assert.False(t, changed)
+}
+
+func TestClearReadOnly(t *testing.T) {
+	const prefix = "/buckets/b/"
+
+	fc := NewFilerConf()
+	assert.False(t, fc.ClearReadOnly(prefix), "no rule to clear")
+
+	// locked by quota enforcement, then quota removed: still clearable
+	fc.ApplyBucketQuotaReadOnly(prefix, 150, 100)
+	assert.True(t, fc.ClearReadOnly(prefix))
+	assert.False(t, fc.MatchStorageRule(prefix).ReadOnly)
+	assert.False(t, fc.ClearReadOnly(prefix), "already writable")
+
+	// clearing the flag keeps the rule's other settings
+	fc = NewFilerConf()
+	fc.SetLocationConf(&filer_pb.FilerConf_PathConf{LocationPrefix: prefix, Ttl: "7d", ReadOnly: true})
+	assert.True(t, fc.ClearReadOnly(prefix))
+	rule := fc.MatchStorageRule(prefix)
+	assert.False(t, rule.ReadOnly)
+	assert.Equal(t, "7d", rule.Ttl)
 }

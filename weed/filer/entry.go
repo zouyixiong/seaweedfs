@@ -2,15 +2,19 @@ package filer
 
 import (
 	"os"
+	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type Attr struct {
 	Mtime         time.Time   // time of last modification
 	Crtime        time.Time   // time of creation (OS X only)
+	Ctime         time.Time   // time of last inode change
+	Atime         time.Time   // time of last access
 	Mode          os.FileMode // file mode
 	Uid           uint32      // owner uid
 	Gid           uint32      // group gid
@@ -91,7 +95,12 @@ func (entry *Entry) ToExistingProtoEntry(message *filer_pb.Entry) {
 		return
 	}
 	message.IsDirectory = entry.IsDirectory()
-	message.Attributes = EntryAttributeToPb(entry)
+	// Reuse pre-allocated attributes if available, otherwise allocate
+	if message.Attributes != nil {
+		EntryAttributeToExistingPb(entry, message.Attributes)
+	} else {
+		message.Attributes = EntryAttributeToPb(entry)
+	}
 	message.Chunks = entry.GetChunks()
 	message.Extended = entry.Extended
 	message.HardLinkId = entry.HardLinkId
@@ -142,4 +151,72 @@ func maxUint64(x, y uint64) uint64 {
 		return x
 	}
 	return y
+}
+
+func (entry *Entry) IsExpireS3Enabled() (exist bool) {
+	if entry.Extended != nil {
+		_, exist = entry.Extended[s3_constants.SeaweedFSExpiresS3]
+	}
+	return exist
+}
+
+func (entry *Entry) isS3Entry() bool {
+	if entry.Extended == nil {
+		return false
+	}
+
+	if _, found := entry.Extended[s3_constants.ExtAmzOwnerKey]; found {
+		return true
+	}
+
+	if _, found := entry.Extended[s3_constants.ExtETagKey]; found {
+		return true
+	}
+
+	for key := range entry.Extended {
+		if strings.HasPrefix(key, s3_constants.ExtAmzPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (entry *Entry) ApplyS3ExpiryMetadata() {
+	if entry.TtlSec == 0 {
+		return
+	}
+
+	if _, found := entry.Extended[s3_constants.SeaweedFSExpiresS3]; found {
+		return
+	}
+
+	// The s3 expiry path skips versioned entries, so stamping one would drop its
+	// expiry entirely instead of moving it onto mtime.
+	if entry.IsS3Versioning() {
+		return
+	}
+
+	if !entry.isS3Entry() {
+		return
+	}
+
+	entry.Extended[s3_constants.SeaweedFSExpiresS3] = []byte("true")
+
+	return
+}
+
+func (entry *Entry) IsS3Versioning() (exist bool) {
+	if entry.Extended != nil {
+		_, exist = entry.Extended[s3_constants.ExtVersionIdKey]
+	}
+	return exist
+}
+
+func (entry *Entry) GetS3ExpireTime() (expireTime time.Time) {
+	if entry.Mtime.IsZero() {
+		expireTime = entry.Crtime
+	} else {
+		expireTime = entry.Mtime
+	}
+	return expireTime.Add(time.Duration(entry.TtlSec) * time.Second)
 }

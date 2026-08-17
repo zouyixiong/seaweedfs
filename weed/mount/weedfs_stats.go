@@ -3,11 +3,12 @@ package mount
 import (
 	"context"
 	"fmt"
-	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/seaweedfs/seaweedfs/weed/glog"
-	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"math"
 	"time"
+
+	"github.com/seaweedfs/go-fuse/v2/fuse"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 const blockSize = 512
@@ -15,6 +16,19 @@ const blockSize = 512
 type statsCache struct {
 	filer_pb.StatisticsResponse
 	lastChecked int64 // unix time in seconds
+}
+
+// diskSizes reports the sizes df and the quota work from. By default that is
+// the space the cluster gives up to the data, counting every replica and every
+// EC shard. Under -df.logical it is the data itself, with the free space
+// converted to how much more of it the mount's replication setting allows.
+func (wfs *WFS) diskSizes() (totalSize, usedSize uint64) {
+	// a filer older than the logical sizes sends zeros, so keep reporting the
+	// raw ones rather than an empty filesystem
+	if wfs.option.LogicalDiskUsage && wfs.stats.LogicalTotalSize > 0 {
+		return wfs.stats.LogicalTotalSize, wfs.stats.LogicalUsedSize
+	}
+	return wfs.stats.TotalSize, wfs.stats.UsedSize
 }
 
 func (wfs *WFS) StatFs(cancel <-chan struct{}, in *fuse.InHeader, out *fuse.StatfsOut) (code fuse.Status) {
@@ -42,6 +56,8 @@ func (wfs *WFS) StatFs(cancel <-chan struct{}, in *fuse.InHeader, out *fuse.Stat
 
 			wfs.stats.TotalSize = resp.TotalSize
 			wfs.stats.UsedSize = resp.UsedSize
+			wfs.stats.LogicalTotalSize = resp.LogicalTotalSize
+			wfs.stats.LogicalUsedSize = resp.LogicalUsedSize
 			wfs.stats.FileCount = resp.FileCount
 			wfs.stats.lastChecked = time.Now().Unix()
 
@@ -53,8 +69,7 @@ func (wfs *WFS) StatFs(cancel <-chan struct{}, in *fuse.InHeader, out *fuse.Stat
 		}
 	}
 
-	totalDiskSize := wfs.stats.TotalSize
-	usedDiskSize := wfs.stats.UsedSize
+	totalDiskSize, usedDiskSize := wfs.diskSizes()
 	actualFileCount := wfs.stats.FileCount
 
 	if wfs.option.Quota > 0 && totalDiskSize > uint64(wfs.option.Quota) {
@@ -108,7 +123,7 @@ func (wfs *WFS) StatFs(cancel <-chan struct{}, in *fuse.InHeader, out *fuse.Stat
 	out.Ffree = math.MaxInt64 - actualFileCount
 
 	// Report the maximum length of a name and the minimum fragment size
-	out.NameLen = 1024
+	out.NameLen = 255
 	out.Frsize = uint32(blockSize)
 
 	return fuse.OK

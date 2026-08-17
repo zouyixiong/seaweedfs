@@ -1,9 +1,10 @@
 package topology
 
 import (
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"slices"
 	"strings"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 )
 
 type TopologyInfo struct {
@@ -71,8 +72,9 @@ func (t *Topology) ToVolumeMap() interface{} {
 			dataNodes := make(map[NodeId]interface{})
 			for _, d := range rack.Children() {
 				dn := d.(*DataNode)
-				var volumes []interface{}
-				for _, v := range dn.GetVolumes() {
+				dnVolumes := dn.GetVolumes()
+				volumes := make([]interface{}, 0, len(dnVolumes))
+				for _, v := range dnVolumes {
 					volumes = append(volumes, v)
 				}
 				dataNodes[d.Id()] = volumes
@@ -98,11 +100,18 @@ func (t *Topology) ToVolumeLocations() (volumeLocations []*master_pb.VolumeLocat
 					DataCenter: dn.GetDataCenterId(),
 					GrpcPort:   uint32(dn.GrpcPort),
 				}
-				for _, v := range dn.GetVolumes() {
-					volumeLocation.NewVids = append(volumeLocation.NewVids, uint32(v.Id))
-				}
+				volumeLocation.NewVids = dn.AppendVolumeIds(nil)
+				// A single EC volume's shards can live on multiple disks of
+				// one DataNode, so GetEcShards returns per-(vid,disk) entries.
+				// Dedupe so the snapshot carries each vid once.
+				seenEcVids := make(map[uint32]struct{})
 				for _, s := range dn.GetEcShards() {
-					volumeLocation.NewVids = append(volumeLocation.NewVids, uint32(s.VolumeId))
+					vid := uint32(s.VolumeId)
+					if _, ok := seenEcVids[vid]; ok {
+						continue
+					}
+					seenEcVids[vid] = struct{}{}
+					volumeLocation.NewEcVids = append(volumeLocation.NewEcVids, vid)
 				}
 				volumeLocations = append(volumeLocations, volumeLocation)
 			}
@@ -111,14 +120,14 @@ func (t *Topology) ToVolumeLocations() (volumeLocations []*master_pb.VolumeLocat
 	return
 }
 
-func (t *Topology) ToTopologyInfo() *master_pb.TopologyInfo {
+func (t *Topology) ToTopologyInfo(filter VolumeFilter) *master_pb.TopologyInfo {
 	m := &master_pb.TopologyInfo{
 		Id:        string(t.Id()),
 		DiskInfos: t.diskUsages.ToDiskInfo(),
 	}
 	for _, c := range t.Children() {
 		dc := c.(*DataCenter)
-		m.DataCenterInfos = append(m.DataCenterInfos, dc.ToDataCenterInfo())
+		m.DataCenterInfos = append(m.DataCenterInfos, dc.ToDataCenterInfo(filter))
 	}
 	return m
 }

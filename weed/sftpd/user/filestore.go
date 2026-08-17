@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
@@ -61,7 +62,7 @@ func NewFileStore(filePath string) (*FileStore, error) {
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		// Create an empty users array
 		if err := os.WriteFile(filePath, []byte("[]"), 0600); err != nil {
-			return nil, fmt.Errorf("failed to create user store file: %v", err)
+			return nil, fmt.Errorf("failed to create user store file: %w", err)
 		}
 	}
 
@@ -79,12 +80,12 @@ func (s *FileStore) loadUsers() error {
 
 	data, err := os.ReadFile(s.filePath)
 	if err != nil {
-		return fmt.Errorf("failed to read user store file: %v", err)
+		return fmt.Errorf("failed to read user store file: %w", err)
 	}
 
 	var users []*User
 	if err := json.Unmarshal(data, &users); err != nil {
-		return fmt.Errorf("failed to parse user store file: %v", err)
+		return fmt.Errorf("failed to parse user store file: %w", err)
 	}
 
 	// Clear existing users and add the loaded ones
@@ -98,6 +99,10 @@ func (s *FileStore) loadUsers() error {
 				// If successful, store the marshaled binary format
 				user.PublicKeys[i] = string(pubKey.Marshal())
 			}
+		}
+		// Clean HomeDir to handle trailing slashes and normalize path
+		if user.HomeDir != "" {
+			user.HomeDir = path.Clean(user.HomeDir)
 		}
 		s.users[user.Username] = user
 
@@ -119,11 +124,11 @@ func (s *FileStore) saveUsers() error {
 
 	data, err := json.MarshalIndent(users, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to serialize users: %v", err)
+		return fmt.Errorf("failed to serialize users: %w", err)
 	}
 
 	if err := os.WriteFile(s.filePath, data, 0600); err != nil {
-		return fmt.Errorf("failed to write user store file: %v", err)
+		return fmt.Errorf("failed to write user store file: %w", err)
 	}
 
 	return nil
@@ -258,4 +263,9 @@ func (s *FileStore) CreateUser(username, password string) (*User, error) {
 	}
 
 	return user, nil
+}
+
+// Reload reloads users from the file, useful for HUP signal handling
+func (s *FileStore) Reload() error {
+	return s.loadUsers()
 }

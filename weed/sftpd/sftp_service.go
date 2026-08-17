@@ -36,7 +36,7 @@ type SFTPServiceOptions struct {
 	// SSH Configuration
 	SshPrivateKey  string        // Legacy single host key
 	HostKeysFolder string        // Multiple host keys for different algorithms
-	AuthMethods    []string      // Enabled auth methods: "password", "publickey", "keyboard-interactive"
+	AuthMethods    []string      // Enabled auth methods: "password", "publickey", "certificate"
 	MaxAuthTries   int           // Limit authentication attempts
 	BannerMessage  string        // Pre-auth banner message
 	LoginGraceTime time.Duration // Timeout for authentication
@@ -47,6 +47,13 @@ type SFTPServiceOptions struct {
 
 	// User Management
 	UserStoreFile string // Path to user store file
+
+	// Certificate Authentication
+	TrustedUserCAKeysFile string // Path to file with trusted user CA public keys (OpenSSH authorized_keys format)
+
+	// JWT Configuration for Filer
+	FilerSigningKey          []byte // JWT signing key for filer uploads
+	FilerSigningExpiresAfter int    // JWT token expiration time in seconds
 }
 
 // NewSFTPService creates a new service instance.
@@ -61,7 +68,11 @@ func NewSFTPService(options *SFTPServiceOptions) *SFTPService {
 	service.userStore = userStore
 
 	// Initialize auth manager
-	service.authManager = auth.NewManager(userStore, options.AuthMethods)
+	authManager, err := auth.NewManager(userStore, options.AuthMethods, options.TrustedUserCAKeysFile)
+	if err != nil {
+		glog.Fatalf("Failed to initialize auth manager: %v", err)
+	}
+	service.authManager = authManager
 
 	return &service
 }
@@ -71,7 +82,7 @@ func (s *SFTPService) Serve(listener net.Listener) error {
 	// Build SSH server config
 	sshConfig, err := s.buildSSHConfig()
 	if err != nil {
-		return fmt.Errorf("failed to create SSH config: %v", err)
+		return fmt.Errorf("failed to create SSH config: %w", err)
 	}
 
 	glog.V(0).Infof("Starting Seaweed SFTP service on %s", listener.Addr().String())
@@ -79,7 +90,7 @@ func (s *SFTPService) Serve(listener net.Listener) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			return fmt.Errorf("failed to accept incoming connection: %v", err)
+			return fmt.Errorf("failed to accept incoming connection: %w", err)
 		}
 		go s.handleSSHConnection(conn, sshConfig)
 	}
@@ -110,7 +121,7 @@ func (s *SFTPService) buildSSHConfig() (*ssh.ServerConfig, error) {
 	if s.options.HostKeysFolder != "" {
 		files, err := os.ReadDir(s.options.HostKeysFolder)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read host keys folder: %v", err)
+			return nil, fmt.Errorf("failed to read host keys folder: %w", err)
 		}
 		for _, file := range files {
 			if file.IsDir() {
@@ -201,6 +212,8 @@ func (s *SFTPService) handleSSHConnection(conn net.Conn, config *ssh.ServerConfi
 		s.options.DataCenter,
 		s.options.FilerGroup,
 		sftpUser,
+		s.options.FilerSigningKey,
+		s.options.FilerSigningExpiresAfter,
 	)
 
 	// Ensure home directory exists with proper permissions
@@ -284,8 +297,8 @@ func (s *SFTPService) handleChannel(newChannel ssh.NewChannel, fs *SftpServer) {
 
 // handleSFTP starts the SFTP server on the SSH channel.
 func (s *SFTPService) handleSFTP(channel ssh.Channel, fs *SftpServer) {
-	// Create server options with initial working directory set to user's home
-	serverOptions := sftp.WithStartDirectory(fs.user.HomeDir)
+	// Start at virtual root "/" - toAbsolutePath translates this to the user's HomeDir
+	serverOptions := sftp.WithStartDirectory("/")
 	server := sftp.NewRequestServer(channel, sftp.Handlers{
 		FileGet:  fs,
 		FilePut:  fs,
@@ -298,5 +311,17 @@ func (s *SFTPService) handleSFTP(channel ssh.Channel, fs *SftpServer) {
 		glog.V(0).Info("SFTP client exited session.")
 	} else if err != nil {
 		glog.Errorf("SFTP server finished with error: %v", err)
+	}
+}
+
+// Reload reloads the user store from disk, useful for HUP signal handling
+func (s *SFTPService) Reload() {
+	glog.V(0).Info("Reload SFTP server...")
+	if fileStore, ok := s.userStore.(*user.FileStore); ok {
+		if err := fileStore.Reload(); err != nil {
+			glog.Errorf("Failed to reload user store: %v", err)
+		} else {
+			glog.V(0).Info("Successfully reloaded SFTP user store")
+		}
 	}
 }

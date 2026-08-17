@@ -17,16 +17,25 @@ var ErrorNotFound = errors.New("not found")
 var ErrorDeleted = errors.New("already deleted")
 var ErrorSizeMismatch = errors.New("size mismatch")
 
+// IoErrorTolerance is the number of consecutive EIOs a volume must
+// see before CollectHeartbeat treats the replica as broken. A single
+// transient error is forgiven so a brief NFS / fabric / power blip
+// affecting several replicas at once does not cascade into removal of
+// the last healthy copy.
+const IoErrorTolerance = 3
+
 func (v *Volume) checkReadWriteError(err error) {
 	if err == nil {
-		if v.lastIoError != nil {
-			v.lastIoError = nil
-		}
+		v.clearIoError()
 		return
 	}
 	if errors.Is(err, syscall.EIO) {
-		v.lastIoError = err
+		v.noteIoError(err)
+		return
 	}
+	// non-EIO error breaks the EIO streak — only sustained EIOs should
+	// be treated as a failing volume.
+	v.clearIoError()
 }
 
 // isFileUnchanged checks whether this needle to write is same as last one.
@@ -54,8 +63,10 @@ func (v *Volume) isFileUnchanged(n *needle.Needle) bool {
 
 var ErrVolumeNotEmpty = fmt.Errorf("volume not empty")
 
-// Destroy removes everything related to this volume
-func (v *Volume) Destroy(onlyEmpty bool) (err error) {
+// Destroy removes everything related to this volume. When keepRemoteData is
+// true the cloud-tier object backing the volume is left intact — used by
+// moves where another server is taking over the same .vif.
+func (v *Volume) Destroy(onlyEmpty bool, keepRemoteData bool) (err error) {
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
 
@@ -70,37 +81,75 @@ func (v *Volume) Destroy(onlyEmpty bool) (err error) {
 			return
 		}
 	}
-	if v.isCompacting || v.isCommitCompacting {
+	if !v.isCompactionInProgress.CompareAndSwap(false, true) {
 		err = fmt.Errorf("volume %d is compacting", v.Id)
 		return
 	}
 	close(v.asyncRequestsChan)
-	storageName, storageKey := v.RemoteStorageNameKey()
-	if v.HasRemoteFile() && storageName != "" && storageKey != "" {
-		if backendStorage, found := backend.BackendStorages[storageName]; found {
-			backendStorage.DeleteFile(storageKey)
+	if !keepRemoteData {
+		storageName, storageKey := v.RemoteStorageNameKey()
+		if v.HasRemoteFile() && storageName != "" && storageKey != "" {
+			if backendStorage, found := backend.BackendStorages[storageName]; found {
+				backendStorage.DeleteFile(storageKey)
+			}
 		}
 	}
+	// A regular volume and an EC volume for the same id share <base>.vif. When
+	// EC artefacts coexist on this disk (e.g. shards distributed onto a source
+	// replica before it is deleted), keep the .vif so removing the regular
+	// volume does not strip the EC volume's info file.
+	keepVif := v.sharesVifWithEcVolume()
 	v.doClose()
-	removeVolumeFiles(v.DataFileName())
-	removeVolumeFiles(v.IndexFileName())
+	removeVolumeFiles(v.DataFileName(), keepVif)
+	removeVolumeFiles(v.IndexFileName(), keepVif)
 	return
 }
 
-func removeVolumeFiles(filename string) {
-	// basic
-	os.Remove(filename + ".dat")
-	os.Remove(filename + ".idx")
-	os.Remove(filename + ".vif")
+// sharesVifWithEcVolume reports whether an EC volume for this volume id lives
+// on the same disk, in which case its .vif is the same file as the regular
+// volume's and must outlive the regular volume's deletion.
+func (v *Volume) sharesVifWithEcVolume() bool {
+	if v.location == nil {
+		return false
+	}
+	if _, found := v.location.FindEcVolume(v.Id); found {
+		return true
+	}
+	return v.location.HasEcxFileOnDisk(v.Collection, v.Id)
+}
+
+func removeVolumeFiles(filename string, keepVif bool) {
+	// .dat/.idx removals log at V(0) so destructive calls are traceable.
+	deleteAndLog := func(ext string) {
+		fullFilename := filename + "." + ext
+		st, statErr := os.Stat(fullFilename)
+		err := os.RemoveAll(fullFilename)
+		if err != nil {
+			glog.V(0).Infof("failed to remove volume file %s: %s", fullFilename, err)
+			return
+		}
+		if statErr == nil && (ext == "dat" || ext == "idx") {
+			glog.Infof("removed volume file %s (size=%d)", fullFilename, st.Size())
+		}
+	}
+	deleteAndLog("dat")
+	deleteAndLog("idx")
+	if !keepVif {
+		deleteAndLog("vif")
+	}
 	// sorted index file
-	os.Remove(filename + ".sdx")
+	deleteAndLog("sdx")
 	// compaction
-	os.Remove(filename + ".cpd")
-	os.Remove(filename + ".cpx")
+	deleteAndLog("cpd")
+	deleteAndLog("cpx")
+	// compaction commit marker
+	deleteAndLog("cpc")
 	// level db index file
-	os.RemoveAll(filename + ".ldb")
+	deleteAndLog("ldb")
+	// redb index file (Rust volume server)
+	deleteAndLog("rdb")
 	// marker for damaged or incomplete volume
-	os.Remove(filename + ".note")
+	deleteAndLog("note")
 }
 
 func (v *Volume) asyncRequestAppend(request *needle.AsyncRequest) {
@@ -122,7 +171,7 @@ func (v *Volume) writeNeedle2(n *needle.Needle, checkCookie bool, fsync bool) (o
 		n.Ttl = v.Ttl
 	}
 
-	if fsync {
+	if !fsync {
 		return v.syncWrite(n, checkCookie)
 	} else {
 		asyncRequest := needle.NewAsyncRequest(n, true)
@@ -149,7 +198,7 @@ func (v *Volume) doWriteRequest(n *needle.Needle, checkCookie bool) (offset uint
 	if ok {
 		existingNeedle, _, _, existingNeedleReadErr := needle.ReadNeedleHeader(v.DataBackend, v.Version(), nv.Offset.ToActualOffset())
 		if existingNeedleReadErr != nil {
-			err = fmt.Errorf("reading existing needle: %v", existingNeedleReadErr)
+			err = fmt.Errorf("reading existing needle: %w", existingNeedleReadErr)
 			return
 		}
 		if n.Cookie == 0 && !checkCookie {
@@ -179,7 +228,8 @@ func (v *Volume) doWriteRequest(n *needle.Needle, checkCookie bool) (offset uint
 	// add to needle map
 	if !ok || uint64(nv.Offset.ToActualOffset()) < offset {
 		if err = v.nm.Put(n.Id, ToOffset(int64(offset)), n.Size); err != nil {
-			glog.V(4).Infof("failed to save in needle map %d: %v", n.Id, err)
+			err = fmt.Errorf("index needle %d of volume %d at offset %d: %w", n.Id, v.Id, offset, err)
+			glog.V(0).Info(err)
 		}
 	}
 	if v.lastModifiedTsSeconds < n.LastModified {
@@ -221,11 +271,11 @@ func (v *Volume) doDeleteRequest(n *needle.Needle) (Size, error) {
 	glog.V(4).Infof("delete needle %s", needle.NewFileIdFromNeedle(v.Id, n).String())
 	nv, ok := v.nm.Get(n.Id)
 	// fmt.Println("key", n.Id, "volume offset", nv.Offset, "data_size", n.Size, "cached size", nv.Size)
-	if ok && nv.Size.IsValid() {
+	if ok && !nv.Size.IsDeleted() {
 		var offset uint64
 		var err error
 		size := nv.Size
-		if !v.hasRemoteFile {
+		if !v.HasRemoteFile() {
 			n.Data = nil
 			n.UpdateAppendAtNs(v.lastAppendAtNs)
 			offset, _, _, err = n.Append(v.DataBackend, v.Version())
@@ -323,6 +373,22 @@ func (v *Volume) WriteNeedleBlob(needleId NeedleId, needleBlob []byte, size Size
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
 
+	// nm.Put on a read-only volume fails only after the blob is appended to .dat.
+	if v.IsReadOnly() {
+		return fmt.Errorf("volume %d is read only", v.Id)
+	}
+
+	// size indexes the needle and places the v3 append timestamp, so a caller using
+	// the payload-only DataSize corrupts both, silently until the needle is read back.
+	if len(needleBlob) < NeedleHeaderSize {
+		return fmt.Errorf("needle %d blob of %d bytes is shorter than a needle header", needleId, len(needleBlob))
+	}
+	var blobHeader needle.Needle
+	blobHeader.ParseNeedleHeader(needleBlob)
+	if blobHeader.Size != size {
+		return fmt.Errorf("needle %d size %d does not match its blob header size %d", needleId, size, blobHeader.Size)
+	}
+
 	if MaxPossibleVolumeSize < v.nm.ContentSize()+uint64(len(needleBlob)) {
 		return fmt.Errorf("volume size limit %d exceeded! current size is %d", MaxPossibleVolumeSize, v.nm.ContentSize())
 	}
@@ -351,7 +417,8 @@ func (v *Volume) WriteNeedleBlob(needleId NeedleId, needleBlob []byte, size Size
 
 	// add to needle map
 	if err = v.nm.Put(needleId, ToOffset(int64(offset)), size); err != nil {
-		glog.V(4).Infof("failed to put in needle map %d: %v", needleId, err)
+		err = fmt.Errorf("index needle %d of volume %d at offset %d: %w", needleId, v.Id, offset, err)
+		glog.V(0).Info(err)
 	}
 
 	return err

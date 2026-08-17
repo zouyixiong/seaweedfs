@@ -4,8 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"io"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 )
 
 func init() {
@@ -52,7 +53,7 @@ func (c *commandRaftServerAdd) Do(args []string, commandEnv *CommandEnv, writer 
 			Voter:   *serverVoter,
 		})
 		if err != nil {
-			return fmt.Errorf("raft add server: %v", err)
+			return fmt.Errorf("raft add server: %w", err)
 		}
 		println("added server", *serverId)
 		return nil

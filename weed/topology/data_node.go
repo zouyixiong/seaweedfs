@@ -22,6 +22,23 @@ type DataNode struct {
 	LastSeen      int64 // unix time in seconds
 	Counter       int   // in race condition, the previous dataNode was not dead
 	IsTerminating bool
+
+	MaintenanceMode bool
+	// lookupDigest covers the volumes reachable through this node in the volume
+	// layouts, for comparison against what its disks actually hold.
+	lookupDigest atomic.Uint64
+	// duplicateVolumeIds records that the node last reported one volume id more
+	// than once, which the master cannot represent.
+	duplicateVolumeIds atomic.Bool
+	// diskMetas holds each physical disk's tags, type, and capacity from the
+	// heartbeat DiskTags, including disks with no volumes or EC shards.
+	diskMetas map[uint32]diskMeta
+}
+
+type diskMeta struct {
+	tags           []string
+	diskType       types.DiskType
+	maxVolumeCount int64
 }
 
 func NewDataNode(id string) *DataNode {
@@ -30,6 +47,7 @@ func NewDataNode(id string) *DataNode {
 	dn.nodeType = "DataNode"
 	dn.diskUsages = newDiskUsages()
 	dn.children = make(map[NodeId]Node)
+	dn.capacityReservations = newCapacityReservations()
 	dn.NodeImpl.value = dn
 	return dn
 }
@@ -61,26 +79,39 @@ func (dn *DataNode) doAddOrUpdateVolume(v storage.VolumeInfo) (isNew, isChanged 
 	return disk.AddOrUpdateVolume(v)
 }
 
+// AddProvisionalVolume records a volume the master registered on its own,
+// ahead of any server report naming it. See Disk.AddProvisionalVolume.
+func (dn *DataNode) AddProvisionalVolume(v storage.VolumeInfo) (isNew, isChanged bool) {
+	dn.Lock()
+	defer dn.Unlock()
+	disk := dn.getOrCreateDisk(v.DiskType)
+	return disk.AddProvisionalVolume(v)
+}
+
 // UpdateVolumes detects new/deleted/changed volumes on a volume server
 // used in master to notify master clients of these changes.
 func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolumes, deletedVolumes, changedVolumes []storage.VolumeInfo) {
 
-	actualVolumeMap := make(map[needle.VolumeId]storage.VolumeInfo)
+	reported := newReportedVolumes(len(actualVolumes))
 	for _, v := range actualVolumes {
-		actualVolumeMap[v.Id] = v
+		reported.add(v.Id, v.DiskType)
 	}
+
+	// A volume id mounted on two disks of one server -- a stale twin re-attached
+	// after a disk repair -- is reported twice, but the master keys volumes by
+	// id alone and keeps only the last copy. Its digest can then never equal the
+	// server's however often the list is resent, so record it and let the
+	// heartbeat fall back to the full list for this node.
+	dn.duplicateVolumeIds.Store(reported.duplicated)
 
 	dn.Lock()
 	defer dn.Unlock()
 
-	existingVolumes := dn.getVolumes()
-
-	for _, v := range existingVolumes {
-		vid := v.Id
-		if _, ok := actualVolumeMap[vid]; !ok {
-			glog.V(0).Infoln("Deleting volume id:", vid)
-			disk := dn.getOrCreateDisk(v.DiskType)
-			disk.DeleteVolumeById(vid)
+	keptCount := 0
+	for _, c := range dn.children {
+		disk := c.(*Disk)
+		for _, v := range disk.RemoveVolumesNotIn(reported) {
+			glog.V(0).Infoln("Deleting volume id:", v.Id)
 			deletedVolumes = append(deletedVolumes, v)
 
 			deltaDiskUsage := &DiskUsageCounts{}
@@ -93,6 +124,13 @@ func (dn *DataNode) UpdateVolumes(actualVolumes []storage.VolumeInfo) (newVolume
 			}
 			disk.UpAdjustDiskUsageDelta(types.ToDiskType(v.DiskType), deltaDiskUsage)
 		}
+		keptCount += disk.VolumeCount()
+	}
+	// Everything still on the node is also in this heartbeat, so the remainder
+	// is what the node is about to gain. A steady-state heartbeat gains nothing
+	// and must not allocate here; a reconnecting server gains all of them.
+	if addedCount := reported.count() - keptCount; addedCount > 0 {
+		newVolumes = make([]storage.VolumeInfo, 0, addedCount)
 	}
 	for _, v := range actualVolumes {
 		isNew, isChanged := dn.doAddOrUpdateVolume(v)
@@ -154,14 +192,75 @@ func (dn *DataNode) AdjustMaxVolumeCounts(maxVolumeCounts map[string]uint32) {
 	}
 }
 
+// AdjustDiskUsageBytes records the physical filesystem capacity a volume server
+// reports per disk type, applied as a delta so it flows through the same
+// aggregation as the volume counts. Mirrors AdjustMaxVolumeCounts; entries with a
+// zero total are treated as "not reported" and skipped.
+func (dn *DataNode) AdjustDiskUsageBytes(diskTotalBytes, diskFreeBytes map[string]uint64) {
+	for diskType, totalBytes := range diskTotalBytes {
+		// Unlike maxVolumeCount, a 0 here is not "unset" but "not reported": let it
+		// flow through so a later heartbeat that drops physical-capacity reporting
+		// (e.g. statfs starts failing) clears the stale bytes and the gate falls
+		// back to slot-only instead of trusting outdated capacity.
+		dt := types.ToDiskType(diskType)
+		currentDiskUsage := dn.diskUsages.getOrCreateDisk(dt)
+		currentTotal := atomic.LoadInt64(&currentDiskUsage.diskTotalBytes)
+		currentFree := atomic.LoadInt64(&currentDiskUsage.diskFreeBytes)
+		newTotal := int64(totalBytes)
+		newFree := int64(diskFreeBytes[diskType])
+		if currentTotal == newTotal && currentFree == newFree {
+			continue
+		}
+		disk := dn.getOrCreateDisk(dt.String())
+		disk.UpAdjustDiskUsageDelta(dt, &DiskUsageCounts{
+			diskTotalBytes: newTotal - currentTotal,
+			diskFreeBytes:  newFree - currentFree,
+		})
+	}
+}
+
+// AppendVolumeIds appends the ids of this node's volumes to dst, without
+// copying the volume records to read them.
+func (dn *DataNode) AppendVolumeIds(dst []uint32) []uint32 {
+	dn.RLock()
+	defer dn.RUnlock()
+	for _, c := range dn.children {
+		dst = c.(*Disk).AppendVolumeIds(dst)
+	}
+	return dst
+}
+
 func (dn *DataNode) GetVolumes() (ret []storage.VolumeInfo) {
 	dn.RLock()
+	defer dn.RUnlock()
+	total := 0
 	for _, c := range dn.children {
-		disk := c.(*Disk)
-		ret = append(ret, disk.GetVolumes()...)
+		total += c.(*Disk).VolumeCount()
 	}
-	dn.RUnlock()
+	ret = make([]storage.VolumeInfo, 0, total)
+	for _, c := range dn.children {
+		ret = c.(*Disk).AppendVolumes(ret)
+	}
 	return ret
+}
+
+// HasDuplicateVolumeIds reports whether the node's last full report named one
+// volume id more than once. While it does, the node's digest is not meaningful.
+func (dn *DataNode) HasDuplicateVolumeIds() bool {
+	return dn.duplicateVolumeIds.Load()
+}
+
+// VolumeDigest summarises every volume the master believes this node holds. A
+// volume server that reports a different digest has drifted from the master and
+// needs to resend its volume list.
+func (dn *DataNode) VolumeDigest() uint64 {
+	dn.RLock()
+	defer dn.RUnlock()
+	var digest uint64
+	for _, c := range dn.children {
+		digest ^= c.(*Disk).VolumeDigest()
+	}
+	return digest
 }
 
 func (dn *DataNode) GetVolumesById(id needle.VolumeId) (vInfo storage.VolumeInfo, err error) {
@@ -263,38 +362,84 @@ func (dn *DataNode) ToInfo() (info DataNodeInfo) {
 	return
 }
 
-func (dn *DataNode) ToDataNodeInfo() *master_pb.DataNodeInfo {
+func (dn *DataNode) ToDataNodeInfo(filter VolumeFilter) *master_pb.DataNodeInfo {
 	m := &master_pb.DataNodeInfo{
-		Id:        string(dn.Id()),
-		DiskInfos: make(map[string]*master_pb.DiskInfo),
+		Id: string(dn.Id()),
+		// Start from disk usage counters so empty disks are still represented
+		// even when there are no volumes/EC shards on this data node yet.
+		DiskInfos: dn.diskUsages.ToDiskInfo(),
 		GrpcPort:  uint32(dn.GrpcPort),
+		Address:   dn.Url(), // ip:port for connecting to the volume server
 	}
+	if m.DiskInfos == nil {
+		m.DiskInfos = make(map[string]*master_pb.DiskInfo)
+	}
+	for diskType, diskInfo := range m.DiskInfos {
+		if diskInfo == nil {
+			m.DiskInfos[diskType] = &master_pb.DiskInfo{Type: diskType}
+			continue
+		}
+		diskInfo.Type = diskType
+	}
+
 	for _, c := range dn.Children() {
 		disk := c.(*Disk)
-		m.DiskInfos[string(disk.Id())] = disk.ToDiskInfo()
+		m.DiskInfos[string(disk.Id())] = disk.ToDiskInfo(filter)
+	}
+
+	dn.RLock()
+	metas := make(map[uint32]diskMeta, len(dn.diskMetas))
+	for diskID, meta := range dn.diskMetas {
+		metas[diskID] = meta
+	}
+	dn.RUnlock()
+	for _, diskInfo := range m.DiskInfos {
+		if diskInfo == nil {
+			continue
+		}
+		if meta, found := metas[diskInfo.DiskId]; found {
+			diskInfo.Tags = append([]string(nil), meta.tags...)
+		}
+		// Max per physical disk of this type, empty and unavailable (max 0) ones
+		// included. Emit only when some disk reports capacity, so an older server
+		// sending all zeros leaves the map nil and falls back.
+		diskType := types.ToDiskType(diskInfo.Type)
+		maxByDisk := make(map[uint32]int64)
+		anyCapacity := false
+		for diskID, meta := range metas {
+			if meta.diskType != diskType {
+				continue
+			}
+			if meta.maxVolumeCount > 0 {
+				anyCapacity = true
+			}
+			maxByDisk[diskID] = meta.maxVolumeCount
+		}
+		if anyCapacity {
+			diskInfo.MaxVolumeCountByDisk = maxByDisk
+		}
 	}
 	return m
 }
 
-// GetVolumeIds returns the human readable volume ids limited to count of max 100.
-func (dn *DataNode) GetVolumeIds() string {
-	dn.RLock()
-	defer dn.RUnlock()
-	existingVolumes := dn.getVolumes()
-	ids := make([]int, 0, len(existingVolumes))
-
-	for k := range existingVolumes {
-		ids = append(ids, int(k))
+func (dn *DataNode) UpdateDiskTags(tags []*master_pb.DiskTag) {
+	if len(tags) == 0 {
+		return
 	}
-
-	return util.HumanReadableIntsMax(100, ids...)
-}
-
-func (dn *DataNode) getVolumes() []storage.VolumeInfo {
-	var existingVolumes []storage.VolumeInfo
-	for _, c := range dn.children {
-		disk := c.(*Disk)
-		existingVolumes = append(existingVolumes, disk.GetVolumes()...)
+	// DiskTags is the full list on each full heartbeat; rebuild fresh to drop
+	// removed disks.
+	metas := make(map[uint32]diskMeta, len(tags))
+	for _, tagInfo := range tags {
+		if tagInfo == nil {
+			continue
+		}
+		metas[tagInfo.DiskId] = diskMeta{
+			tags:           append([]string(nil), tagInfo.Tags...),
+			diskType:       types.ToDiskType(tagInfo.Type),
+			maxVolumeCount: tagInfo.MaxVolumeCount,
+		}
 	}
-	return existingVolumes
+	dn.Lock()
+	dn.diskMetas = metas
+	dn.Unlock()
 }

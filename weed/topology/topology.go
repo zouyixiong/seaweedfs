@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -27,6 +29,12 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
+const (
+	// WarmupPulseMultiplier is the number of heartbeat intervals to wait after
+	// a leader change before treating volume lookup misses as definitive.
+	WarmupPulseMultiplier = 3
+)
+
 type Topology struct {
 	vacuumLockCounter int64
 	NodeImpl
@@ -37,9 +45,11 @@ type Topology struct {
 
 	pulse int64
 
-	volumeSizeLimit  uint64
-	replicationAsMin bool
-	isDisableVacuum  bool
+	volumeSizeLimit          uint64
+	replicationAsMin         bool
+	vacuumDisabledByOperator atomic.Bool // true when operator manually disables vacuum
+	vacuumDisabledByPlugin   atomic.Bool // true when disabled by the vacuum plugin monitor
+	adminServerConnectedFunc func() bool // optional callback to check admin server presence
 
 	Sequence sequence.Sequencer
 
@@ -57,7 +67,20 @@ type Topology struct {
 	UuidAccessLock sync.RWMutex
 	UuidMap        map[string][]string
 
-	LastLeaderChangeTime time.Time
+	topologyId     string
+	topologyIdLock sync.RWMutex
+
+	lastLeaderChangeTime     time.Time
+	hadVolumesAtLeaderChange bool
+	lastLeaderChangeTimeLock sync.RWMutex
+
+	// dataNodeIndex is an address -> *DataNode lookup so callers (e.g. the
+	// Ping admission gate) do not have to walk every dc/rack/node tier on
+	// every request. Keys use the canonical http form returned by
+	// pb.ServerAddress.ToHttpAddress so a target like "1.2.3.4:8080" finds
+	// the same node whether or not the grpc port suffix is present.
+	dataNodeIndex     map[string]*DataNode
+	dataNodeIndexLock sync.RWMutex
 }
 
 func NewTopology(id string, seq sequence.Sequencer, volumeSizeLimit uint64, pulse int, replicationAsMin bool) *Topology {
@@ -67,6 +90,7 @@ func NewTopology(id string, seq sequence.Sequencer, volumeSizeLimit uint64, puls
 	t.NodeImpl.value = t
 	t.diskUsages = newDiskUsages()
 	t.children = make(map[NodeId]Node)
+	t.capacityReservations = newCapacityReservations()
 	t.collectionMap = util.NewConcurrentReadMap()
 	t.ecShardMap = make(map[needle.VolumeId]*EcShardLocations)
 	t.pulse = int64(pulse)
@@ -79,8 +103,63 @@ func NewTopology(id string, seq sequence.Sequencer, volumeSizeLimit uint64, puls
 	t.chanCrowdedVolumes = make(chan storage.VolumeInfo)
 
 	t.Configuration = &Configuration{}
+	t.dataNodeIndex = make(map[string]*DataNode)
 
 	return t
+}
+
+// LookupDataNodeByAddress returns the registered DataNode that serves addr,
+// or nil if no such node has been observed. Lookup is O(1) and uses the
+// canonical http form of the address so callers that pass either
+// "host:port" or "host:port.grpc" find the same node.
+func (t *Topology) LookupDataNodeByAddress(addr pb.ServerAddress) *DataNode {
+	if addr == "" {
+		return nil
+	}
+	t.dataNodeIndexLock.RLock()
+	defer t.dataNodeIndexLock.RUnlock()
+	if t.dataNodeIndex == nil {
+		return nil
+	}
+	return t.dataNodeIndex[addr.ToHttpAddress()]
+}
+
+// registerDataNodeAddress records dn in the address index under its current
+// http address. Callers must invoke unregisterDataNodeAddress with the prior
+// address whenever a node's Ip or Port changes (e.g. k8s pod reschedule).
+func (t *Topology) registerDataNodeAddress(dn *DataNode) {
+	if dn == nil {
+		return
+	}
+	key := dn.ServerAddress().ToHttpAddress()
+	if key == "" {
+		return
+	}
+	t.dataNodeIndexLock.Lock()
+	defer t.dataNodeIndexLock.Unlock()
+	if t.dataNodeIndex == nil {
+		t.dataNodeIndex = make(map[string]*DataNode)
+	}
+	t.dataNodeIndex[key] = dn
+}
+
+// unregisterDataNodeAddress removes the index entry for addr, but only when
+// the entry still points at dn. The conditional guard avoids dropping a
+// freshly re-registered node whose address happens to alias the one being
+// removed (e.g. legacy id transitions or a fast restart).
+func (t *Topology) unregisterDataNodeAddress(addr pb.ServerAddress, dn *DataNode) {
+	if addr == "" {
+		return
+	}
+	key := addr.ToHttpAddress()
+	if key == "" {
+		return
+	}
+	t.dataNodeIndexLock.Lock()
+	defer t.dataNodeIndexLock.Unlock()
+	if existing, ok := t.dataNodeIndex[key]; ok && (dn == nil || existing == dn) {
+		delete(t.dataNodeIndex, key)
+	}
 }
 
 func (t *Topology) IsChildLocked() (bool, error) {
@@ -105,6 +184,64 @@ func (t *Topology) IsChildLocked() (bool, error) {
 	return false, nil
 }
 
+// SetLastLeaderChangeTime records the time of the most recent leader transition.
+// It also snapshots whether the topology already had known volumes at that
+// moment. IsWarmingUp uses the snapshot instead of the live MaxVolumeId so a
+// fresh cluster that happens to grow its first volume inside the warmup window
+// does not retroactively flip into "warming up" state — there is no prior
+// topology to wait for on a bootstrap.
+func (t *Topology) SetLastLeaderChangeTime(ts time.Time) {
+	hadVolumes := t.GetMaxVolumeId() > 0
+	t.lastLeaderChangeTimeLock.Lock()
+	defer t.lastLeaderChangeTimeLock.Unlock()
+	t.lastLeaderChangeTime = ts
+	t.hadVolumesAtLeaderChange = hadVolumes
+}
+
+// GetLastLeaderChangeTime returns the time of the most recent leader transition.
+func (t *Topology) GetLastLeaderChangeTime() time.Time {
+	t.lastLeaderChangeTimeLock.RLock()
+	defer t.lastLeaderChangeTimeLock.RUnlock()
+	return t.lastLeaderChangeTime
+}
+
+// IsWarmingUp returns true if the master recently became leader and may not yet
+// have a complete topology. After a leader change or restart, volume servers need
+// up to WarmupPulseMultiplier heartbeat intervals to reconnect and report their volumes.
+// Returns false on a fresh cluster start — i.e. when no volumes existed at the
+// time of the leader change — since there is no prior topology state to wait for.
+// Checking the *live* MaxVolumeId here would make a bootstrapping cluster flip
+// into warming-up the moment its first volume is grown, which manifested as a
+// 15-second window of spurious Unavailable errors on AssignVolume for workloads
+// that start writing immediately (see #8777).
+func (t *Topology) IsWarmingUp() bool {
+	t.lastLeaderChangeTimeLock.RLock()
+	lastChange := t.lastLeaderChangeTime
+	hadVolumes := t.hadVolumesAtLeaderChange
+	t.lastLeaderChangeTimeLock.RUnlock()
+	if !hadVolumes || lastChange.IsZero() {
+		return false
+	}
+	return time.Since(lastChange) < t.WarmupDuration()
+}
+
+// WarmupDuration returns the configured warmup duration based on pulse interval.
+func (t *Topology) WarmupDuration() time.Duration {
+	return time.Duration(t.pulse*WarmupPulseMultiplier) * time.Second
+}
+
+// RemainingWarmupDuration returns how much warmup time is left, or 0 if not warming up.
+func (t *Topology) RemainingWarmupDuration() time.Duration {
+	if !t.IsWarmingUp() {
+		return 0
+	}
+	remaining := t.WarmupDuration() - time.Since(t.GetLastLeaderChangeTime())
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
 func (t *Topology) IsLeader() bool {
 	t.RaftServerAccessLock.RLock()
 	defer t.RaftServerAccessLock.RUnlock()
@@ -113,8 +250,10 @@ func (t *Topology) IsLeader() bool {
 		if t.RaftServer.State() == raft.Leader {
 			return true
 		}
-		if leader, err := t.Leader(); err == nil {
-			if pb.ServerAddress(t.RaftServer.Name()) == leader {
+		// Directly check leader to avoid re-acquiring lock via MaybeLeader()
+		leader := pb.ServerAddress(t.RaftServer.Leader())
+		if leader != "" {
+			if pb.ServerAddress(t.RaftServer.Name()).Equals(leader) {
 				return true
 			}
 		}
@@ -171,6 +310,16 @@ func (t *Topology) Leader() (l pb.ServerAddress, err error) {
 		func() (l pb.ServerAddress, err error) {
 			l, err = t.MaybeLeader()
 			if err == nil && l == "" {
+				// Thread-safe check if we are the leader
+				t.RaftServerAccessLock.RLock()
+				if t.RaftServer != nil && t.RaftServer.State() == raft.Leader {
+					l = pb.ServerAddress(t.RaftServer.Name())
+				}
+				t.RaftServerAccessLock.RUnlock()
+
+				if l != "" {
+					return l, nil
+				}
 				err = leaderNotSelected
 			}
 			return l, err
@@ -233,11 +382,11 @@ func (t *Topology) NextVolumeId() (needle.VolumeId, error) {
 	defer t.RaftServerAccessLock.RUnlock()
 
 	if t.RaftServer != nil {
-		if _, err := t.RaftServer.Do(NewMaxVolumeIdCommand(next)); err != nil {
+		if _, err := t.RaftServer.Do(NewMaxVolumeIdCommand(next, t.GetTopologyId())); err != nil {
 			return 0, err
 		}
 	} else if t.HashicorpRaft != nil {
-		b, err := json.Marshal(NewMaxVolumeIdCommand(next))
+		b, err := json.Marshal(NewMaxVolumeIdCommand(next, t.GetTopologyId()))
 		if err != nil {
 			return 0, fmt.Errorf("failed marshal NewMaxVolumeIdCommand: %+v", err)
 		}
@@ -248,7 +397,11 @@ func (t *Topology) NextVolumeId() (needle.VolumeId, error) {
 	return next, nil
 }
 
-func (t *Topology) PickForWrite(requestedCount uint64, option *VolumeGrowOption, volumeLayout *VolumeLayout) (fileId string, count uint64, volumeLocationList *VolumeLocationList, shouldGrow bool, err error) {
+// DefaultNeedleSizeEstimate is the fallback per-file-ID size estimate when
+// the client does not provide an expected data size.
+const DefaultNeedleSizeEstimate uint64 = 1024 * 1024 // 1 MB
+
+func (t *Topology) PickForWrite(requestedCount uint64, option *VolumeGrowOption, volumeLayout *VolumeLayout, expectedDataSize uint64) (fileId string, count uint64, volumeLocationList *VolumeLocationList, shouldGrow bool, err error) {
 	var vid needle.VolumeId
 	vid, count, volumeLocationList, shouldGrow, err = volumeLayout.PickForWrite(requestedCount, option)
 	if err != nil {
@@ -256,6 +409,16 @@ func (t *Topology) PickForWrite(requestedCount uint64, option *VolumeGrowOption,
 	}
 	if volumeLocationList == nil || volumeLocationList.Length() == 0 {
 		return "", 0, nil, shouldGrow, fmt.Errorf("%s available for collection:%s replication:%s ttl:%s", NoWritableVolumes, option.Collection, option.ReplicaPlacement.String(), option.Ttl.String())
+	}
+	// Track estimated assigned bytes to spread load between heartbeats.
+	// Use the client hint if provided, otherwise fall back to 1MB estimate.
+	sizePerFile := DefaultNeedleSizeEstimate
+	if expectedDataSize > 0 {
+		sizePerFile = expectedDataSize
+	}
+	pendingBytes := min(uint64(count)*sizePerFile, uint64(math.MaxInt64))
+	if volumeLayout.RecordAssign(vid, int64(pendingBytes)) {
+		volumeLayout.AdjustActiveVolumeCountForFull(vid)
 	}
 	nextFileId := t.Sequence.NextFileId(requestedCount)
 	fileId = needle.NewFileId(vid, nextFileId, rand.Uint32()).String()
@@ -266,6 +429,38 @@ func (t *Topology) GetVolumeLayout(collectionName string, rp *super_block.Replic
 	return t.collectionMap.Get(collectionName, func() interface{} {
 		return NewCollection(collectionName, t.volumeSizeLimit, t.replicationAsMin)
 	}).(*Collection).GetOrCreateVolumeLayout(rp, ttl, diskType)
+}
+
+// CollectionVolumeStats aggregates stats across all volume layouts and EC
+// volumes of one collection, or across every collection when collectionName is
+// empty.
+func (t *Topology) CollectionVolumeStats(collectionName string) *VolumeLayoutStats {
+	ret := &VolumeLayoutStats{}
+	var collections []*Collection
+	if collectionName == "" {
+		for _, c := range t.collectionMap.Items() {
+			collections = append(collections, c.(*Collection))
+		}
+	} else if c, found := t.FindCollection(collectionName); found {
+		collections = append(collections, c)
+	}
+	for _, c := range collections {
+		for _, vl := range c.GetAllVolumeLayouts() {
+			stats := vl.Stats()
+			ret.TotalSize += stats.TotalSize
+			ret.UsedSize += stats.UsedSize
+			ret.LogicalUsedSize += stats.LogicalUsedSize
+			ret.FileCount += stats.FileCount
+		}
+	}
+	// EC volumes live outside collectionMap, so a collection whose volumes are
+	// all encoded has no layout left to report them
+	ecStats := t.CollectionEcVolumeStats(collectionName)
+	ret.TotalSize += ecStats.TotalSize
+	ret.UsedSize += ecStats.UsedSize
+	ret.LogicalUsedSize += ecStats.LogicalUsedSize
+	ret.FileCount += ecStats.FileCount
+	return ret
 }
 
 func (t *Topology) ListCollections(includeNormalVolumes, includeEcVolumes bool) (ret []string) {
@@ -304,7 +499,19 @@ func (t *Topology) FindCollection(collectionName string) (*Collection, bool) {
 }
 
 func (t *Topology) DeleteCollection(collectionName string) {
+	// The layouts vanish with the collection, but every location they served
+	// holds a bit in its node's lookup digest. Left in place, those bits keep
+	// the node's held and servable digests apart forever, and the master asks
+	// for the full volume list on every heartbeat from then on.
+	// Unpublish first so a racing registration re-resolves into a fresh collection.
+	collection, found := t.FindCollection(collectionName)
 	t.collectionMap.Delete(collectionName)
+	if !found {
+		return
+	}
+	for _, vl := range collection.GetAllVolumeLayouts() {
+		vl.releaseLookupOwnership()
+	}
 }
 
 func (t *Topology) DeleteLayout(collectionName string, rp *super_block.ReplicaPlacement, ttl *needle.TTL, diskType types.DiskType) {
@@ -320,9 +527,14 @@ func (t *Topology) DeleteLayout(collectionName string, rp *super_block.ReplicaPl
 
 func (t *Topology) RegisterVolumeLayout(v storage.VolumeInfo, dn *DataNode) {
 	diskType := types.ToDiskType(v.DiskType)
-	vl := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
-	vl.RegisterVolume(&v, dn)
-	vl.EnsureCorrectWritables(&v)
+	for {
+		vl := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
+		if vl.RegisterVolume(&v, dn) {
+			vl.EnsureCorrectWritables(&v)
+			return
+		}
+		// Dropped with its collection; the next lookup creates a fresh one.
+	}
 }
 
 func (t *Topology) UnRegisterVolumeLayout(v storage.VolumeInfo, dn *DataNode) {
@@ -392,7 +604,7 @@ func (t *Topology) ListDCAndRacks() (dcs map[NodeId][]NodeId) {
 
 func (t *Topology) SyncDataNodeRegistration(volumes []*master_pb.VolumeInformationMessage, dn *DataNode) (newVolumes, deletedVolumes []storage.VolumeInfo) {
 	// convert into in memory struct storage.VolumeInfo
-	var volumeInfos []storage.VolumeInfo
+	volumeInfos := make([]storage.VolumeInfo, 0, len(volumes))
 	for _, v := range volumes {
 		if vi, err := storage.NewVolumeInfo(v); err == nil {
 			volumeInfos = append(volumeInfos, vi)
@@ -413,6 +625,39 @@ func (t *Topology) SyncDataNodeRegistration(volumes []*master_pb.VolumeInformati
 		diskType := types.ToDiskType(v.DiskType)
 		vl := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
 		vl.EnsureCorrectWritables(&v)
+	}
+	// Update effective sizes for all reported volumes (decay pending estimates).
+	// If decay brings a volume eagerly removed by RecordAssign back under the
+	// writable threshold, restore the matching activeVolumeCount.
+	for _, v := range volumeInfos {
+		if v.ReplicaPlacement == nil {
+			continue
+		}
+		diskType := types.ToDiskType(v.DiskType)
+		vl := t.GetVolumeLayout(v.Collection, v.ReplicaPlacement, v.Ttl, diskType)
+		// Self-heal: a volume reported by the data node but missing from the
+		// lookup index is re-registered. This repairs the split left by a
+		// disconnect/reconnect race, where UnRegisterDataNode dropped the volume
+		// from vid2location but the reconnecting full heartbeat skipped it
+		// (still in the disk map, so UpdateVolumes did not report it as new).
+		// Without this, the volume stays visible in volume.list/admin UI yet
+		// LookupVolume returns "volume id not found".
+		if !vl.HasDataNode(v.Id, dn) {
+			if vl.RegisterVolume(&v, dn) {
+				vl.EnsureCorrectWritables(&v)
+			} else {
+				// Dropped with its collection; re-resolve.
+				t.RegisterVolumeLayout(v, dn)
+			}
+			// Volumes new to the disk map were registered above, so reaching
+			// here means only the lookup index had lost it. Clients were told
+			// it went when the node dropped out, so the repair has to tell them
+			// it is back.
+			newVolumes = append(newVolumes, v)
+		}
+		if vl.UpdateVolumeSize(v.Id, v.Size, v.CompactRevision) {
+			vl.AdjustActiveVolumeCountAfterRecovery(v.Id)
+		}
 	}
 	return
 }
@@ -447,6 +692,53 @@ func (t *Topology) IncrementalSyncDataNodeRegistration(newVolumes, deletedVolume
 	return
 }
 
+// ApplyVolumeChanges records the volumes a heartbeat reported as changed and
+// returns the ones the node did not already have. Only the named volumes are
+// touched: unlike a full report, silence about a volume says nothing about
+// whether the server still has it.
+//
+// Most changes are a volume growing, which moves no location, so returning
+// only the arrivals keeps a busy cluster from telling every client about
+// volumes they can already reach.
+func (t *Topology) ApplyVolumeChanges(changed []*master_pb.VolumeInformationMessage, dn *DataNode) (newVolumes []storage.VolumeInfo) {
+	volumeInfos := make([]storage.VolumeInfo, 0, len(changed))
+	for _, v := range changed {
+		vi, err := storage.NewVolumeInfo(v)
+		if err != nil {
+			glog.V(0).Infof("Fail to convert changed volume information: %v", err)
+			continue
+		}
+		volumeInfos = append(volumeInfos, vi)
+	}
+
+	for _, vi := range volumeInfos {
+		isNew, _ := dn.AddOrUpdateVolume(vi)
+		if vi.ReplicaPlacement == nil {
+			if isNew {
+				newVolumes = append(newVolumes, vi)
+			}
+			continue
+		}
+		vl := t.GetVolumeLayout(vi.Collection, vi.ReplicaPlacement, vi.Ttl, types.ToDiskType(vi.DiskType))
+		// Reaching the lookup index is what makes a volume servable, so a
+		// volume only that index had lost is an arrival as far as clients are
+		// concerned: they were told it went when the node dropped out.
+		becameServable := !vl.HasDataNode(vi.Id, dn)
+		for becameServable && !vl.RegisterVolume(&vi, dn) {
+			// Dropped with its collection; the next lookup creates a fresh one.
+			vl = t.GetVolumeLayout(vi.Collection, vi.ReplicaPlacement, vi.Ttl, types.ToDiskType(vi.DiskType))
+		}
+		if isNew || becameServable {
+			newVolumes = append(newVolumes, vi)
+		}
+		vl.EnsureCorrectWritables(&vi)
+		if vl.UpdateVolumeSize(vi.Id, vi.Size, vi.CompactRevision) {
+			vl.AdjustActiveVolumeCountAfterRecovery(vi.Id)
+		}
+	}
+	return newVolumes
+}
+
 func (t *Topology) DataNodeRegistration(dcName, rackName string, dn *DataNode) {
 	if dn.Parent() != nil {
 		return
@@ -458,12 +750,68 @@ func (t *Topology) DataNodeRegistration(dcName, rackName string, dn *DataNode) {
 	glog.Infof("[%s] reLink To topo  ", dn.Id())
 }
 
-func (t *Topology) DisableVacuum() {
-	glog.V(0).Infof("DisableVacuum")
-	t.isDisableVacuum = true
+// IsVacuumDisabled returns true if vacuum is disabled by either the
+// operator or the plugin monitor.
+func (t *Topology) IsVacuumDisabled() bool {
+	return t.vacuumDisabledByOperator.Load() || t.vacuumDisabledByPlugin.Load()
 }
 
+// DisableVacuum is called by the operator (shell command / manual RPC).
+// Only sets the operator flag; does not affect the plugin flag.
+func (t *Topology) DisableVacuum() {
+	glog.V(0).Infof("DisableVacuum (by operator)")
+	t.vacuumDisabledByOperator.Store(true)
+}
+
+// EnableVacuum is called by the operator (shell command / manual RPC).
+// Only clears the operator flag; does not affect the plugin flag.
 func (t *Topology) EnableVacuum() {
-	glog.V(0).Infof("EnableVacuum")
-	t.isDisableVacuum = false
+	glog.V(0).Infof("EnableVacuum (by operator)")
+	t.vacuumDisabledByOperator.Store(false)
+}
+
+// DisableVacuumByPlugin is called by the admin server's vacuum monitor
+// when a vacuum plugin worker connects. Only sets the plugin flag.
+func (t *Topology) DisableVacuumByPlugin() {
+	glog.V(0).Infof("DisableVacuum (by plugin worker)")
+	t.vacuumDisabledByPlugin.Store(true)
+}
+
+// EnableVacuumByPlugin is called by the admin server's vacuum monitor
+// when a vacuum plugin worker disconnects. Only clears the plugin flag.
+func (t *Topology) EnableVacuumByPlugin() {
+	glog.V(0).Infof("EnableVacuum (by plugin worker)")
+	t.vacuumDisabledByPlugin.Store(false)
+}
+
+// IsVacuumDisabledByPlugin returns whether the plugin monitor has disabled vacuum.
+func (t *Topology) IsVacuumDisabledByPlugin() bool {
+	return t.vacuumDisabledByPlugin.Load()
+}
+
+// SetAdminServerConnectedFunc sets an optional callback used by the vacuum
+// safety net to detect when the admin server has disconnected.
+func (t *Topology) SetAdminServerConnectedFunc(f func() bool) {
+	t.adminServerConnectedFunc = f
+}
+
+func (t *Topology) GetTopologyId() string {
+	t.topologyIdLock.RLock()
+	defer t.topologyIdLock.RUnlock()
+	return t.topologyId
+}
+
+func (t *Topology) SetTopologyId(topologyId string) {
+	t.topologyIdLock.Lock()
+	defer t.topologyIdLock.Unlock()
+	if topologyId == "" {
+		return
+	}
+	if t.topologyId == "" {
+		t.topologyId = topologyId
+		return
+	}
+	if t.topologyId != topologyId {
+		glog.Fatalf("Split-brain detected! Current TopologyId is %s, but received %s. Stopping to prevent data corruption.", t.topologyId, topologyId)
+	}
 }

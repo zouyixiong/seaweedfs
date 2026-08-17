@@ -3,6 +3,7 @@ package agent_client
 import (
 	"context"
 	"fmt"
+
 	"github.com/seaweedfs/seaweedfs/weed/mq/topic"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_agent_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/schema_pb"
@@ -50,13 +51,13 @@ func NewSubscribeSession(agentAddress string, option *SubscribeOption) (*Subscri
 
 	stream, err := agentClient.SubscribeRecord(context.Background())
 	if err != nil {
-		return nil, fmt.Errorf("subscribe record: %v", err)
+		return nil, fmt.Errorf("subscribe record: %w", err)
 	}
 
 	if err = stream.Send(&mq_agent_pb.SubscribeRecordRequest{
 		Init: initRequest,
 	}); err != nil {
-		return nil, fmt.Errorf("send session id: %v", err)
+		return nil, fmt.Errorf("send session id: %w", err)
 	}
 
 	return &SubscribeSession{
@@ -76,12 +77,11 @@ func (a *SubscribeSession) SubscribeMessageRecord(
 	for {
 		resp, err := a.stream.Recv()
 		if err != nil {
+			if onCompletionFn != nil {
+				onCompletionFn()
+			}
 			return err
 		}
 		onEachMessageFn(resp.Key, resp.Value)
 	}
-	if onCompletionFn != nil {
-		onCompletionFn()
-	}
-	return nil
 }

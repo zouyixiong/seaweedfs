@@ -1,9 +1,10 @@
 package topology
 
 import (
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"slices"
 	"strings"
+
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 )
 
 type DataCenter struct {
@@ -16,6 +17,7 @@ func NewDataCenter(id string) *DataCenter {
 	dc.nodeType = "DataCenter"
 	dc.diskUsages = newDiskUsages()
 	dc.children = make(map[NodeId]Node)
+	dc.capacityReservations = newCapacityReservations()
 	dc.NodeImpl.value = dc
 	return dc
 }
@@ -54,14 +56,14 @@ func (dc *DataCenter) ToInfo() (info DataCenterInfo) {
 	return
 }
 
-func (dc *DataCenter) ToDataCenterInfo() *master_pb.DataCenterInfo {
+func (dc *DataCenter) ToDataCenterInfo(filter VolumeFilter) *master_pb.DataCenterInfo {
 	m := &master_pb.DataCenterInfo{
 		Id:        string(dc.Id()),
 		DiskInfos: dc.diskUsages.ToDiskInfo(),
 	}
 	for _, c := range dc.Children() {
 		rack := c.(*Rack)
-		m.RackInfos = append(m.RackInfos, rack.ToRackInfo())
+		m.RackInfos = append(m.RackInfos, rack.ToRackInfo(filter))
 	}
 	return m
 }

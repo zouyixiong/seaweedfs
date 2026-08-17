@@ -2,12 +2,14 @@ package weed_server
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -15,76 +17,144 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
 func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req *filer_pb.CacheRemoteObjectToLocalClusterRequest) (*filer_pb.CacheRemoteObjectToLocalClusterResponse, error) {
+	// Use singleflight to deduplicate concurrent caching requests for the same object.
+	// This benefits all clients: S3 API, filer HTTP, Hadoop, etc.
+	cacheKey := req.Directory + "/" + req.Name
 
-	// load all mappings
-	mappingEntry, err := fs.filer.FindEntry(ctx, util.JoinPath(filer.DirectoryEtcRemote, filer.REMOTE_STORAGE_MOUNT_FILE))
-	if err != nil {
-		return nil, err
-	}
-	mappings, err := filer.UnmarshalRemoteStorageMappings(mappingEntry.Content)
-	if err != nil {
-		return nil, err
-	}
+	// Detach from caller ctx: on failure the error path deletes every chunk
+	// already written, so cancelling mid-download loses all progress. For
+	// blobs large enough that the download outlasts the caller's timeout
+	// the retry loop never converges.
+	bgCtx := context.WithoutCancel(ctx)
 
-	// find mapping
-	var remoteStorageMountedLocation *remote_pb.RemoteStorageLocation
-	var localMountedDir string
-	for k, loc := range mappings.Mappings {
-		if strings.HasPrefix(req.Directory, k) {
-			localMountedDir, remoteStorageMountedLocation = k, loc
+	// DoChan (vs Do) so the caller can bail out on ctx.Done() while the
+	// singleflight goroutine keeps caching on bgCtx; otherwise this handler
+	// goroutine stays blocked for the full download after the client is gone.
+	ch := fs.remoteCacheGroup.DoChan(cacheKey, func() (interface{}, error) {
+		return fs.doCacheRemoteObjectToLocalCluster(bgCtx, req)
+	})
+
+	select {
+	case <-ctx.Done():
+		// Caller gave up; the detached cache keeps running and a later
+		// request will find the entry cached (or join the same singleflight).
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Shared {
+			glog.V(2).Infof("CacheRemoteObjectToLocalCluster: shared result for %s", cacheKey)
 		}
+		if res.Err != nil {
+			// The sentinel would cross gRPC as codes.Unknown; make it canonical
+			// so remote callers can classify a vanished entry.
+			if errors.Is(res.Err, filer_pb.ErrNotFound) {
+				return nil, status.Error(codes.NotFound, res.Err.Error())
+			}
+			return nil, res.Err
+		}
+		if res.Val == nil {
+			return nil, fmt.Errorf("unexpected nil result from singleflight")
+		}
+		resp, ok := res.Val.(*filer_pb.CacheRemoteObjectToLocalClusterResponse)
+		if !ok {
+			return nil, fmt.Errorf("unexpected result type from singleflight")
+		}
+		return resp, nil
 	}
-	if localMountedDir == "" {
-		return nil, fmt.Errorf("%s is not mounted", req.Directory)
-	}
+}
 
-	// find storage configuration
-	storageConfEntry, err := fs.filer.FindEntry(ctx, util.JoinPath(filer.DirectoryEtcRemote, remoteStorageMountedLocation.Name+filer.REMOTE_STORAGE_CONF_SUFFIX))
-	if err != nil {
-		return nil, err
-	}
-	storageConf := &remote_pb.RemoteConf{}
-	if unMarshalErr := proto.Unmarshal(storageConfEntry.Content, storageConf); unMarshalErr != nil {
-		return nil, fmt.Errorf("unmarshal remote storage conf %s/%s: %v", filer.DirectoryEtcRemote, remoteStorageMountedLocation.Name+filer.REMOTE_STORAGE_CONF_SUFFIX, unMarshalErr)
-	}
+// doCacheRemoteObjectToLocalCluster performs the actual caching operation.
+// This is called from singleflight, so only one instance runs per object.
+func (fs *FilerServer) doCacheRemoteObjectToLocalCluster(ctx context.Context, req *filer_pb.CacheRemoteObjectToLocalClusterRequest) (*filer_pb.CacheRemoteObjectToLocalClusterResponse, error) {
+	lockPath := util.JoinPath(req.Directory, req.Name)
+	entry, logTsNs, err := fs.fencedFindEntry(ctx, lockPath)
 
-	// find the entry
-	entry, err := fs.filer.FindEntry(ctx, util.JoinPath(req.Directory, req.Name))
 	if err == filer_pb.ErrNotFound {
 		return nil, err
 	}
+	if err != nil {
+		return nil, fmt.Errorf("find entry %s/%s: %v", req.Directory, req.Name, err)
+	}
 
-	resp := &filer_pb.CacheRemoteObjectToLocalClusterResponse{}
+	resp := &filer_pb.CacheRemoteObjectToLocalClusterResponse{LogTsNs: logTsNs, LogSignature: fs.filer.Signature}
+
+	// Early return if not a remote-only object or already cached
 	if entry.Remote == nil || entry.Remote.RemoteSize == 0 {
+		resp.Entry = entry.ToProtoEntry()
+		return resp, nil
+	}
+	if len(entry.GetChunks()) > 0 {
+		// Already has local chunks - already cached
+		glog.V(2).Infof("CacheRemoteObjectToLocalCluster: %s/%s already cached (%d chunks)", req.Directory, req.Name, len(entry.GetChunks()))
+		resp.Entry = entry.ToProtoEntry()
 		return resp, nil
 	}
 
+	glog.V(1).Infof("CacheRemoteObjectToLocalCluster: caching %s/%s (remote size: %d)", req.Directory, req.Name, entry.Remote.RemoteSize)
+
+	storageConf, remoteLocation, err := fs.resolveMountedRemote(ctx, req.Directory, req.Name)
+	if err != nil {
+		return nil, err
+	}
+
 	// detect storage option
-	so, err := fs.detectStorageOption(req.Directory, "", "", 0, "", "", "", "")
+	so, err := fs.detectStorageOption(ctx, req.Directory, "", "", 0, "", "", "", "")
 	if err != nil {
 		return resp, err
 	}
 	assignRequest, altRequest := so.ToAssignRequests(1)
 
-	// find a good chunk size
-	chunkSize := int64(5 * 1024 * 1024)
-	chunkCount := entry.Remote.RemoteSize/chunkSize + 1
-	for chunkCount > 1000 && chunkSize < int64(fs.option.MaxMB)*1024*1024/2 {
-		chunkSize *= 2
-		chunkCount = entry.Remote.RemoteSize/chunkSize + 1
+	// adaptive chunk size: target ~32 chunks per file to balance
+	// per-chunk overhead (volume assign, gRPC, needle write) against parallelism
+	chunkSize := int64(5 * 1024 * 1024) // 5MB floor
+	maxChunkSize := int64(fs.option.MaxMB) * 1024 * 1024
+	if maxChunkSize < chunkSize {
+		maxChunkSize = chunkSize
+	}
+	targetChunks := int64(32)
+	if entry.Remote.RemoteSize/targetChunks > chunkSize {
+		chunkSize = entry.Remote.RemoteSize / targetChunks
+		if chunkSize > maxChunkSize {
+			chunkSize = maxChunkSize
+		}
+	}
+	// final safety check: ensure no more than 1000 chunks
+	if (entry.Remote.RemoteSize+chunkSize-1)/chunkSize > 1000 {
+		chunkSize = (entry.Remote.RemoteSize + 999) / 1000
 	}
 
-	dest := util.FullPath(remoteStorageMountedLocation.Path).Child(string(util.FullPath(req.Directory).Child(req.Name))[len(localMountedDir):])
+	// Now that chunkSize is known, hint it to the master so per-chunk
+	// assigns don't fall back to the 1 MB default estimate. Slightly over-
+	// estimates for the final partial chunk (< chunkSize) by design.
+	assignRequest.ExpectedDataSize = uint64(chunkSize)
+	if altRequest != nil {
+		altRequest.ExpectedDataSize = uint64(chunkSize)
+	}
 
 	var chunks []*filer_pb.FileChunk
+	var chunksMu sync.Mutex
 	var fetchAndWriteErr error
 	var wg sync.WaitGroup
 
-	limitedConcurrentExecutor := util.NewLimitedConcurrentExecutor(8)
+	chunkConcurrency := int(req.ChunkConcurrency)
+	if chunkConcurrency <= 0 {
+		chunkConcurrency = 8
+	} else if chunkConcurrency > 1024 {
+		glog.V(0).Infof("capping chunkConcurrency from %d to 1024", chunkConcurrency)
+		chunkConcurrency = 1024
+	}
+	downloadConcurrency := req.DownloadConcurrency
+	if downloadConcurrency > 1024 {
+		glog.V(0).Infof("capping downloadConcurrency from %d to 1024", downloadConcurrency)
+		downloadConcurrency = 1024
+	}
+
+	limitedConcurrentExecutor := util.NewLimitedConcurrentExecutor(chunkConcurrency)
 	for offset := int64(0); offset < entry.Remote.RemoteSize; offset += chunkSize {
 		localOffset := offset
 
@@ -97,18 +167,30 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 			}
 
 			// assign one volume server
-			assignResult, err := operation.Assign(fs.filer.GetMaster, fs.grpcDialOption, assignRequest, altRequest)
+			assignResult, err := operation.Assign(ctx, fs.filer.GetMaster, fs.grpcDialOption, assignRequest, altRequest)
 			if err != nil {
-				fetchAndWriteErr = err
+				chunksMu.Lock()
+				if fetchAndWriteErr == nil {
+					fetchAndWriteErr = err
+				}
+				chunksMu.Unlock()
 				return
 			}
 			if assignResult.Error != "" {
-				fetchAndWriteErr = fmt.Errorf("assign: %v", assignResult.Error)
+				chunksMu.Lock()
+				if fetchAndWriteErr == nil {
+					fetchAndWriteErr = fmt.Errorf("assign: %v", assignResult.Error)
+				}
+				chunksMu.Unlock()
 				return
 			}
 			fileId, parseErr := needle.ParseFileIdFromString(assignResult.Fid)
-			if assignResult.Error != "" {
-				fetchAndWriteErr = fmt.Errorf("unrecognized file id %s: %v", assignResult.Fid, parseErr)
+			if parseErr != nil {
+				chunksMu.Lock()
+				if fetchAndWriteErr == nil {
+					fetchAndWriteErr = fmt.Errorf("unrecognized file id %s: %v", assignResult.Fid, parseErr)
+				}
+				chunksMu.Unlock()
 				return
 			}
 
@@ -125,36 +207,35 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 			assignedServerAddress := pb.NewServerAddressWithGrpcPort(assignResult.Url, assignResult.GrpcPort)
 			var etag string
 			err = operation.WithVolumeServerClient(false, assignedServerAddress, fs.grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-				resp, fetchAndWriteErr := volumeServerClient.FetchAndWriteNeedle(context.Background(), &volume_server_pb.FetchAndWriteNeedleRequest{
-					VolumeId:   uint32(fileId.VolumeId),
-					NeedleId:   uint64(fileId.Key),
-					Cookie:     uint32(fileId.Cookie),
-					Offset:     localOffset,
-					Size:       size,
-					Replicas:   replicas,
-					Auth:       string(assignResult.Auth),
-					RemoteConf: storageConf,
-					RemoteLocation: &remote_pb.RemoteStorageLocation{
-						Name:   remoteStorageMountedLocation.Name,
-						Bucket: remoteStorageMountedLocation.Bucket,
-						Path:   string(dest),
-					},
+				resp, fetchErr := volumeServerClient.FetchAndWriteNeedle(context.Background(), &volume_server_pb.FetchAndWriteNeedleRequest{
+					VolumeId:            uint32(fileId.VolumeId),
+					NeedleId:            uint64(fileId.Key),
+					Cookie:              uint32(fileId.Cookie),
+					Offset:              localOffset,
+					Size:                size,
+					Replicas:            replicas,
+					Auth:                string(assignResult.Auth),
+					DownloadConcurrency: downloadConcurrency,
+					RemoteConf:          storageConf,
+					RemoteLocation:      remoteLocation,
 				})
-				if fetchAndWriteErr != nil {
-					return fmt.Errorf("volume server %s fetchAndWrite %s: %v", assignResult.Url, dest, fetchAndWriteErr)
-				} else {
-					etag = resp.ETag
+				if fetchErr != nil {
+					return fmt.Errorf("volume server %s fetchAndWrite %s: %v", assignResult.Url, remoteLocation.Path, fetchErr)
 				}
+				etag = resp.ETag
 				return nil
 			})
 
-			if err != nil && fetchAndWriteErr == nil {
-				fetchAndWriteErr = err
+			if err != nil {
+				chunksMu.Lock()
+				if fetchAndWriteErr == nil {
+					fetchAndWriteErr = err
+				}
+				chunksMu.Unlock()
 				return
 			}
 
-			chunks = append(chunks, &filer_pb.FileChunk{
-
+			chunk := &filer_pb.FileChunk{
 				FileId:       assignResult.Fid,
 				Offset:       localOffset,
 				Size:         uint64(size),
@@ -165,13 +246,58 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 					FileKey:  uint64(fileId.Key),
 					Cookie:   uint32(fileId.Cookie),
 				},
-			})
+			}
+			chunksMu.Lock()
+			chunks = append(chunks, chunk)
+			chunksMu.Unlock()
 		})
 	}
 
 	wg.Wait()
-	if fetchAndWriteErr != nil {
-		return nil, fetchAndWriteErr
+
+	chunksMu.Lock()
+	err = fetchAndWriteErr
+	// Sort chunks by offset to maintain file order
+	sort.Slice(chunks, func(i, j int) bool {
+		return chunks[i].Offset < chunks[j].Offset
+	})
+	chunksMu.Unlock()
+	if err != nil {
+		// Clean up any chunks that were successfully written before the error.
+		// Without this, partial downloads leave orphaned needles in volume servers
+		// that accumulate across retry cycles and cannot be reclaimed by vacuum.
+		if len(chunks) > 0 {
+			fs.filer.DeleteUncommittedChunks(ctx, chunks)
+		}
+		return nil, err
+	}
+
+	// Commit under the mutation path lock so a fenced lookup cannot land
+	// between the store update and its notification, handing out
+	// under-versioned state. Re-read under it: the entry may have changed
+	// during the unlocked download, and the stale base would clobber it.
+	commitLock := fs.entryLockTable.AcquireLock("CacheRemoteObjectToLocalCluster", lockPath, util.ExclusiveLock)
+	defer fs.entryLockTable.ReleaseLock(lockPath, commitLock)
+
+	commitLogTsNs := time.Now().UnixNano()
+	current, err := fs.filer.FindEntry(ctx, lockPath)
+	if err != nil {
+		fs.filer.DeleteUncommittedChunks(ctx, chunks)
+		if err == filer_pb.ErrNotFound {
+			// Deleted while the download ran; keep the sentinel so callers
+			// still surface a 404 rather than a generic failure.
+			return nil, err
+		}
+		return nil, fmt.Errorf("find entry %s before commit: %v", lockPath, err)
+	}
+	if !filer.EqualEntry(current, entry) {
+		// Changed during the download: that writer supersedes the cached
+		// content. Return the current state, fenced at this read.
+		fs.filer.DeleteUncommittedChunks(ctx, chunks)
+		resp.Entry = current.ToProtoEntry()
+		resp.LogTsNs = commitLogTsNs
+		resp.LogSignature = fs.filer.Signature
+		return resp, nil
 	}
 
 	garbage := entry.GetChunks()
@@ -184,15 +310,49 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 	// this skips meta data log events
 
 	if err := fs.filer.Store.UpdateEntry(context.Background(), newEntry); err != nil {
-		fs.filer.DeleteUncommittedChunks(chunks)
+		fs.filer.DeleteUncommittedChunks(ctx, chunks)
 		return nil, err
 	}
-	fs.filer.DeleteChunks(entry.FullPath, garbage)
+	fs.filer.DeleteChunks(ctx, entry.FullPath, garbage)
 
+	ctx, eventSink := filer.WithMetadataEventSink(ctx)
 	fs.filer.NotifyUpdateEvent(ctx, entry, newEntry, true, false, nil)
 
 	resp.Entry = newEntry.ToProtoEntry()
+	resp.MetadataEvent = eventSink.Last()
+	resp.LogTsNs = commitLogTsNs
+	resp.LogSignature = fs.filer.Signature
 
 	return resp, nil
 
+}
+
+// resolveMountedRemote reads /etc/remote fresh (so conf changes need no restart)
+// and maps dir/name to its remote storage conf and remote location.
+func (fs *FilerServer) resolveMountedRemote(ctx context.Context, dir, name string) (*remote_pb.RemoteConf, *remote_pb.RemoteStorageLocation, error) {
+	mappingEntry, err := fs.filer.FindEntry(ctx, util.JoinPath(filer.DirectoryEtcRemote, filer.REMOTE_STORAGE_MOUNT_FILE))
+	if err != nil {
+		return nil, nil, err
+	}
+	mappings, err := filer.UnmarshalRemoteStorageMappings(mappingEntry.Content)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	localMountedDir, remoteStorageMountedLocation, err := filer.FindMountedRemoteMapping(mappings, dir)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	storageConfEntry, err := fs.filer.FindEntry(ctx, util.JoinPath(filer.DirectoryEtcRemote, remoteStorageMountedLocation.Name+filer.REMOTE_STORAGE_CONF_SUFFIX))
+	if err != nil {
+		return nil, nil, err
+	}
+	storageConf := &remote_pb.RemoteConf{}
+	if unMarshalErr := proto.Unmarshal(storageConfEntry.Content, storageConf); unMarshalErr != nil {
+		return nil, nil, fmt.Errorf("unmarshal remote storage conf %s/%s: %v", filer.DirectoryEtcRemote, remoteStorageMountedLocation.Name+filer.REMOTE_STORAGE_CONF_SUFFIX, unMarshalErr)
+	}
+
+	remoteLocation := filer.MapFullPathToRemoteStorageLocation(util.FullPath(localMountedDir), remoteStorageMountedLocation, util.FullPath(dir).Child(name))
+	return storageConf, remoteLocation, nil
 }

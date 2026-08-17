@@ -2,8 +2,8 @@
 package user
 
 import (
-	"math/rand"
-	"path/filepath"
+	"math/rand/v2"
+	"path"
 )
 
 // User represents an SFTP user with authentication and permission details
@@ -22,12 +22,12 @@ func NewUser(username string) *User {
 	// Generate a random UID/GID between 1000 and 60000
 	// This range is typically safe for regular users in most systems
 	// 0-999 are often reserved for system users
-	randomId := 1000 + rand.Intn(59000)
+	randomId := 1000 + rand.IntN(59000)
 
 	return &User{
 		Username:    username,
 		Permissions: make(map[string][]string),
-		HomeDir:     filepath.Join("/home", username),
+		HomeDir:     path.Join("/home", username),
 		Uid:         uint32(randomId),
 		Gid:         uint32(randomId),
 	}

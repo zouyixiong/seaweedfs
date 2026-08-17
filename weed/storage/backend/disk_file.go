@@ -1,12 +1,13 @@
 package backend
 
 import (
-	"github.com/seaweedfs/seaweedfs/weed/glog"
-	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"io"
 	"os"
 	"runtime"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 var (
@@ -112,6 +113,13 @@ func (df *DiskFile) GetStat() (datSize int64, modTime time.Time, err error) {
 
 func (df *DiskFile) Name() string {
 	return df.fullFilePath
+}
+
+func (df *DiskFile) Fd() uintptr {
+	if df.File == nil {
+		return ^uintptr(0)
+	}
+	return df.File.Fd()
 }
 
 func (df *DiskFile) Sync() error {
