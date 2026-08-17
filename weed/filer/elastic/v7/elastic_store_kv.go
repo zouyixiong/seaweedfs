@@ -38,14 +38,18 @@ func (store *ElasticStore) KvGet(ctx context.Context, key []byte) (value []byte,
 	if elastic.IsNotFound(err) {
 		return value, filer.ErrKvNotFound
 	}
-	if searchResult != nil && searchResult.Found {
-		esEntry := &ESKVEntry{}
-		if err := jsoniter.Unmarshal(searchResult.Source, esEntry); err == nil {
-			return esEntry.Value, nil
-		}
+	if err != nil {
+		glog.Errorf("find key(%s), %v.", string(key), err)
+		return nil, fmt.Errorf("find key %q: %w", string(key), err)
 	}
-	glog.Errorf("find key(%s),%v.", string(key), err)
-	return value, filer.ErrKvNotFound
+	if searchResult == nil || !searchResult.Found {
+		return value, filer.ErrKvNotFound
+	}
+	esEntry := &ESKVEntry{}
+	if err := jsoniter.Unmarshal(searchResult.Source, esEntry); err != nil {
+		return nil, fmt.Errorf("decode key %q: %w", string(key), err)
+	}
+	return esEntry.Value, nil
 }
 
 func (store *ElasticStore) KvPut(ctx context.Context, key []byte, value []byte) (err error) {
